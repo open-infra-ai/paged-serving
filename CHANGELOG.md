@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 请求取消与有界背压设计包（`docs/architecture/cancellation-backpressure-design.md`）：
   冻结 request 状态机所有权表、主动取消触发矩阵、四条 channel 的容量与
   overflow 策略、指标语义口径与测试方式；待评审后分 PR 实现（P0-001/002/003）。
+- 请求所有权驱动的主动取消（PSRV-P0-001 / 设计包 PR-2）：每请求
+  `watch` 取消信号 + handler 侧 `RequestGuard`（Drop 置位），引擎循环每步
+  检出 `has_changed() != Ok(false)`（含 sender 全 drop 的 `Err`——owner
+  消失即取消）；submission 准入预检跳过排队期已取消请求；SSE 流、unary
+  future abort 与 n>1 部分准入失败均经 guard 主动取消；新增
+  `create_router_with_engine_and_shutdown` 返回 shutdown 广播触发端，
+  graceful shutdown 时取消全部在途请求（引擎循环自持保活 sender，避免
+  router 先于响应体析构被误判为 shutdown）。
 
 ### Fixed
 - 服务端不再因仅启用 `tiny-llm` 编译 feature 就被误认为正在使用真实 CUDA

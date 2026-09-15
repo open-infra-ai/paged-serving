@@ -680,6 +680,35 @@ impl GPUExecutorTrait for CountingExecutor {
     }
 }
 
+/// 拉取 /metrics 文本（oneshot 会消费 router，调用方需自行 clone 保留）。
+async fn metrics_text(app: &axum::Router) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+/// 有界轮询 /metrics 直至出现目标行：指标快照由引擎循环每步刷新，
+/// 观测到 `paged_engine_failed_requests 1` 即证明终态已排出、槽位已释放。
+async fn wait_for_metric(app: &axum::Router, needle: &str) {
+    for _ in 0..300 {
+        if metrics_text(app).await.contains(needle) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for metric: {needle}");
+}
+
 #[tokio::test]
 async fn test_client_disconnect_cancels_generation() {
     let executed = Arc::new(AtomicU64::new(0));
@@ -695,6 +724,7 @@ async fn test_client_disconnect_cancels_generation() {
     )
     .unwrap();
     let app = create_router_with_engine(config, engine).unwrap();
+    let metrics_app = app.clone();
 
     let response = app
         .oneshot(
@@ -731,6 +761,9 @@ async fn test_client_disconnect_cancels_generation() {
     assert!(saw_chunk, "stream should produce at least one token chunk");
     drop(body);
 
+    // 确定性屏障：取消终态被排出（取消计入 failed_requests）。
+    wait_for_metric(&metrics_app, "paged_engine_failed_requests 1").await;
+
     // 断连后执行计数必须停下来：间隔采样两次，不再增长。
     // （若无取消机制，5ms/步的引擎会在两次采样间推进上百步。）
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -744,6 +777,130 @@ async fn test_client_disconnect_cancels_generation() {
     assert_eq!(
         first_sample, second_sample,
         "engine must stop executing a request after its client disconnects"
+    );
+}
+
+/// PSRV-P0-001：非流式请求 future 被 abort（client 断连/超时取消）时，
+/// RequestGuard Drop 必须主动取消在途请求并释放资源。
+#[tokio::test]
+async fn test_unary_future_abort_cancels_request() {
+    let config = create_test_config();
+    let engine = InferenceEngine::with_components(
+        config.clone(),
+        Box::new(SimpleTokenizer::without_special_tokens()),
+        Scheduler::new(config.clone()),
+        Box::new(SlowExecutor),
+    )
+    .unwrap();
+    let app = create_router_with_engine(config, engine).unwrap();
+    let metrics_app = app.clone();
+    let req_app = app.clone();
+
+    // unary 请求整体在一个 spawn 的任务里跑：abort 即模拟 handler future
+    // 被丢弃（连接断开）。
+    let task = tokio::spawn(async move {
+        req_app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "prompt": "abort me",
+                            "max_tokens": 500
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+    });
+
+    // 屏障：请求真正进入执行（prefill+decode 序列存在）。
+    wait_for_metric(&metrics_app, "paged_engine_active_sequences 1").await;
+    task.abort();
+
+    // guard Drop → 主动取消 → 终态排出 → 序列槽位释放。
+    wait_for_metric(&metrics_app, "paged_engine_failed_requests 1").await;
+    wait_for_metric(&metrics_app, "paged_engine_active_sequences 0").await;
+}
+
+/// PSRV-P0-001：n>1 流式请求在部分准入失败时，已准入候选必须被显式取消
+/// 并释放序列槽位（不依赖下一次 chunk 发送失败的偶然时点）。
+#[tokio::test]
+async fn test_streaming_n2_partial_admission_cancels_admitted_candidate() {
+    // 并发上限 1：n=2 的第二个候选必然准入失败。
+    let config = EngineConfig {
+        max_num_seqs: 1,
+        max_batch_size: 1, // 同步收紧：单批上限不得超过并发上限
+        serving: ServingConfig {
+            model_name: "test-model".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let engine = InferenceEngine::with_components(
+        config.clone(),
+        Box::new(SimpleTokenizer::without_special_tokens()),
+        Scheduler::new(config.clone()),
+        Box::new(ConstantTokenExecutor { token: 37 }), // 'A'：非空片段
+    )
+    .unwrap();
+    let app = create_router_with_engine(config, engine).unwrap();
+    let metrics_app = app.clone();
+
+    // n=2 stream：候选 1 准入占住唯一槽位，候选 2 必然 429。
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "test-model",
+                        "prompt": "two candidates",
+                        "max_tokens": 500,
+                        "n": 2,
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // 屏障：候选 1 的取消终态已排出（槽位此刻已释放）。
+    wait_for_metric(&metrics_app, "paged_engine_failed_requests 1").await;
+
+    // 行为级证明：新请求立即准入成功（若槽位未释放会得到 429）。
+    let follow_up = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "test-model",
+                        "prompt": "after",
+                        "max_tokens": 2
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        follow_up.status(),
+        StatusCode::OK,
+        "slot from the cancelled candidate must be released"
     );
 }
 

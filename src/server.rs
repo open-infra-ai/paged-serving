@@ -32,7 +32,7 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 /// 提交队列容量；队列满时 handler 异步等待（背压），不会丢失请求。
@@ -134,6 +134,35 @@ struct Submission {
     admit: oneshot::Sender<Result<Admission, EngineError>>,
     /// 该请求的事件流（token 片段 + 终态）。
     events: mpsc::UnboundedSender<RequestEvent>,
+    /// 请求生命周期取消信号：handler 侧 `RequestGuard` Drop 置位。
+    /// 引擎循环每步检出 `has_changed() != Ok(false)`（含 sender 全 drop 的
+    /// `Err`——owner 消失即取消），主动取消而非依赖下一次 chunk 发送失败。
+    cancel: watch::Receiver<bool>,
+}
+
+/// handler 侧的请求所有权 guard：任何消费路径退出（事件 receiver drop、
+/// SSE stream drop、unary future abort、n>1 部分准入失败时显式 drop）
+/// 都在 Drop 中置位取消信号。
+///
+/// 对已到达终态的请求是**无害 no-op**：此时 waiter 已移除，
+/// `cancel_by_request_id` 查无此项返回 false；request_id 不复用，无串扰。
+struct RequestGuard {
+    cancel: watch::Sender<bool>,
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
+/// 引擎循环侧的每请求等待者：事件发送端 + 取消信号接收端。
+struct Waiter {
+    events: mpsc::UnboundedSender<RequestEvent>,
+    cancel: watch::Receiver<bool>,
+    /// 已对该请求签发过 cancel：token 置位状态会持续可读，避免每步重复
+    /// 调用 cancel_by_request_id（终态经 Done 事件排出后才移除 waiter）。
+    cancelled: bool,
 }
 
 /// 引擎循环接受请求后返回的回执。
@@ -152,13 +181,10 @@ enum RequestEvent {
 }
 
 /// 把到达终态的请求路由给其等待者（Done 事件）；对端已断开时静默丢弃。
-fn dispatch_completed(
-    waiters: &mut HashMap<RequestId, mpsc::UnboundedSender<RequestEvent>>,
-    completed: Vec<CompletedRequest>,
-) {
+fn dispatch_completed(waiters: &mut HashMap<RequestId, Waiter>, completed: Vec<CompletedRequest>) {
     for completed in completed {
-        if let Some(tx) = waiters.remove(&completed.request_id) {
-            let _ = tx.send(RequestEvent::Done(completed));
+        if let Some(waiter) = waiters.remove(&completed.request_id) {
+            let _ = waiter.events.send(RequestEvent::Done(completed));
         }
     }
 }
@@ -179,27 +205,40 @@ impl AppState {
         format!("{prefix}-{value}")
     }
 
-    /// 向引擎循环提交请求，返回准入回执与其事件流。
+    /// 向引擎循环提交请求，返回准入回执、事件流与请求所有权 guard。
+    /// guard 必须在请求消费方存活期间持有；其 Drop 主动置位取消信号。
     async fn submit(
         &self,
         prompt: &str,
         params: GenerationParams,
-    ) -> Result<(Admission, mpsc::UnboundedReceiver<RequestEvent>), ApiError> {
+    ) -> Result<
+        (
+            Admission,
+            mpsc::UnboundedReceiver<RequestEvent>,
+            RequestGuard,
+        ),
+        ApiError,
+    > {
         let (admit_tx, admit_rx) = oneshot::channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        // guard 在 Submission 入队前创建：排队等待准入期间 client 断连，
+        // guard Drop 同样置位，`admit_submission` 检出后跳过准入。
+        let guard = RequestGuard { cancel: cancel_tx };
         self.submit_tx
             .send(Submission {
                 prompt: prompt.to_string(),
                 params,
                 admit: admit_tx,
                 events: events_tx,
+                cancel: cancel_rx,
             })
             .await
             .map_err(|_| ApiError::internal("engine loop is not running"))?;
         let admission = admit_rx
             .await
             .map_err(|_| ApiError::internal("engine loop dropped the request"))??;
-        Ok((admission, events_rx))
+        Ok((admission, events_rx, guard))
     }
 
     /// 非流式生成：等待请求到达终态并返回完整结果。
@@ -208,7 +247,9 @@ impl AppState {
         prompt: &str,
         params: GenerationParams,
     ) -> Result<GenerationResult, ApiError> {
-        let (admission, mut events) = self.submit(prompt, params).await?;
+        // _guard 覆盖整个等待窗口：future 被 abort（client 断连）或任何
+        // 提前返回时 Drop 置位，引擎循环下一步检出并释放资源。
+        let (admission, mut events, _guard) = self.submit(prompt, params).await?;
         while let Some(event) = events.recv().await {
             if let RequestEvent::Done(completed) = event {
                 return generation_result(admission.prompt_tokens, completed);
@@ -652,12 +693,37 @@ pub fn create_router_with_engine(
     config: EngineConfig,
     engine: InferenceEngine,
 ) -> Result<Router, EngineError> {
+    let (router, _shutdown_tx) = create_router_with_engine_and_shutdown(config, engine)?;
+    Ok(router)
+}
+
+/// 创建 router 并返回 shutdown 广播触发端。
+///
+/// 对返回的 sender `send(true)` 会令引擎循环取消全部在途请求：SSE 流
+/// 收到终态后结束，axum graceful drain 因而有界，不会被任意长的生成
+/// 挂起。引擎循环自身持有保活 sender 克隆，仅显式 `send(true)` 触发
+/// shutdown；单纯 drop 该句柄不会误触发（router 可先于流式响应体析构）。
+pub fn create_router_with_engine_and_shutdown(
+    config: EngineConfig,
+    engine: InferenceEngine,
+) -> Result<(Router, watch::Sender<bool>), EngineError> {
     config.validate()?;
     let tokenizer: Arc<dyn TokenizerTrait> = Arc::from(build_tokenizer(&config)?);
     let (submit_tx, submit_rx) = mpsc::channel(SUBMISSION_QUEUE_CAPACITY);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let engine_metrics = Arc::new(SharedEngineMetrics::default());
     let engine_metrics_loop = engine_metrics.clone();
-    tokio::spawn(engine_loop(engine, submit_rx, engine_metrics_loop));
+    // 保活 sender 由引擎循环自身持有：通道只在显式 send(true) 时置位。
+    // （若把保活 sender 放在 AppState，router 先于响应体流析构——如
+    // oneshot 测试——sender 全 drop 会被 has_changed 的 Err 误读为 shutdown。）
+    let shutdown_keepalive = shutdown_tx.clone();
+    tokio::spawn(engine_loop(
+        engine,
+        submit_rx,
+        engine_metrics_loop,
+        shutdown_rx,
+        shutdown_keepalive,
+    ));
 
     let state = Arc::new(AppState {
         config,
@@ -668,14 +734,46 @@ pub fn create_router_with_engine(
         tokenizer,
     });
 
-    Ok(Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .fallback(not_found)
-        .with_state(state))
+        .with_state(state);
+
+    Ok((router, shutdown_tx))
+}
+
+/// 检出每请求取消信号与 shutdown 广播，主动取消对应请求。
+///
+/// 判定口径 `has_changed() != Ok(false)`：`Ok(true)` 为显式置位，
+/// `Err` 为 sender 全部 drop（owner 已消失，同样必须取消）。
+/// cancel 后请求立即进入 completed_requests，此时 has_pending_work 可能
+/// 已为 false——必须当步排出 Done，否则下一轮循环阻塞在 `recv()` 上，
+/// 终态事件滞留（shutdown 时 SSE 流悬挂）。
+fn cancel_flagged(
+    engine: &mut InferenceEngine,
+    waiters: &mut HashMap<RequestId, Waiter>,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let shutdown = !matches!(shutdown_rx.has_changed(), Ok(false));
+    let mut flagged: Vec<RequestId> = Vec::new();
+    for (id, waiter) in waiters.iter_mut() {
+        if !waiter.cancelled && (shutdown || !matches!(waiter.cancel.has_changed(), Ok(false))) {
+            waiter.cancelled = true;
+            flagged.push(*id);
+        }
+    }
+    if flagged.is_empty() {
+        return;
+    }
+    for id in flagged {
+        engine.cancel_request(id);
+    }
+    let (completed, _) = engine.collect_completed_requests();
+    dispatch_completed(waiters, completed);
 }
 
 /// 后台引擎循环：引擎的唯一所有者。
@@ -686,9 +784,13 @@ async fn engine_loop(
     mut engine: InferenceEngine,
     mut submit_rx: mpsc::Receiver<Submission>,
     engine_metrics: Arc<SharedEngineMetrics>,
+    shutdown_rx: watch::Receiver<bool>,
+    // 保活 sender：与信号消费方同寿，通道不会因 router/handler 先析构
+    // 而意外关闭（sender 全 drop → has_changed Err → 误判 shutdown）。
+    _shutdown_keepalive: watch::Sender<bool>,
 ) {
-    // request_id → 事件发送端，用于路由每请求事件
-    let mut waiters: HashMap<RequestId, mpsc::UnboundedSender<RequestEvent>> = HashMap::new();
+    // request_id → 等待者（事件发送端 + 取消信号接收端）
+    let mut waiters: HashMap<RequestId, Waiter> = HashMap::new();
 
     // 防死循环（B12 服务层）：pending 因 KV 预算/块不足而永远无法启动时，
     // has_pending_work() 恒真但每步空转（无序列执行、无完成排出、无在途序列）。
@@ -712,6 +814,11 @@ async fn engine_loop(
             admit_submission(&mut engine, submission, &mut waiters);
         }
 
+        // 主动取消检出：guard drop（SSE 断开、unary abort、n>1 部分准入
+        // 失败、排队期 owner 消失）或 shutdown 广播 → 当步取消并排出终态，
+        // 不再依赖下一次 chunk 发送失败的偶然时点。
+        cancel_flagged(&mut engine, &mut waiters, &shutdown_rx);
+
         let mut progressed = false;
         match engine.step_events() {
             Ok(events) => {
@@ -719,9 +826,14 @@ async fn engine_loop(
                 let chunks_len = events.chunks.len();
                 let mut disconnected: Vec<RequestId> = Vec::new();
                 for (request_id, chunk, logprobs) in events.chunks {
-                    if let Some(tx) = waiters.get(&request_id) {
-                        // 发送失败 == 对端已断开：登记取消，释放调度资源
-                        if tx.send(RequestEvent::Chunk(chunk, logprobs)).is_err() {
+                    if let Some(waiter) = waiters.get(&request_id) {
+                        // 发送失败 == 对端已断开：登记取消，释放调度资源。
+                        // （兜底路径：正常断开已由 cancel token 检出。）
+                        if waiter
+                            .events
+                            .send(RequestEvent::Chunk(chunk, logprobs))
+                            .is_err()
+                        {
                             disconnected.push(request_id);
                         }
                     }
@@ -778,8 +890,14 @@ async fn engine_loop(
 fn admit_submission(
     engine: &mut InferenceEngine,
     submission: Submission,
-    waiters: &mut HashMap<RequestId, mpsc::UnboundedSender<RequestEvent>>,
+    waiters: &mut HashMap<RequestId, Waiter>,
 ) {
+    // owner 已在 submission 排队期间消失（guard Drop / cancel 置位 /
+    // sender 全 drop）→ 跳过准入，省一次调度/KV 分配；admit 回执无人
+    // 接收，静默丢弃。
+    if !matches!(submission.cancel.has_changed(), Ok(false)) {
+        return;
+    }
     let result = engine
         .submit_request(&submission.prompt, submission.params)
         .map(|(request_id, prompt_tokens)| Admission {
@@ -787,7 +905,14 @@ fn admit_submission(
             prompt_tokens,
         });
     if let Ok(admission) = &result {
-        waiters.insert(admission.request_id, submission.events);
+        waiters.insert(
+            admission.request_id,
+            Waiter {
+                events: submission.events,
+                cancel: submission.cancel,
+                cancelled: false,
+            },
+        );
     }
     let _ = submission.admit.send(result);
 }
@@ -884,21 +1009,27 @@ async fn respond_generation(
     prepared: PreparedGenerationRequest,
 ) -> Response {
     if prepared.stream {
-        // 流式：为每个候选提交并 fan-in 为单一 SSE 流
+        // 流式：为每个候选提交并 fan-in 为单一 SSE 流；guards 随流持有，
+        // 流 drop（client 断开）时全部候选被主动取消。
         let mut streams = Vec::with_capacity(prepared.n);
+        let mut guards = Vec::with_capacity(prepared.n);
         let mut prompt_tokens = 0;
         for _ in 0..prepared.n {
             match state
                 .submit(&prepared.prompt, prepared.params.clone())
                 .await
             {
-                Ok((admission, events)) => {
+                Ok((admission, events, guard)) => {
                     if streams.is_empty() {
                         prompt_tokens = admission.prompt_tokens;
                     }
                     streams.push(events);
+                    guards.push(guard);
                 }
                 Err(err) => {
+                    // n>1 部分准入失败：drop 已收集的 guards → 主动取消
+                    // 已准入候选，不再等下一次 chunk send 失败回收。
+                    drop(guards);
                     state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
                     return err.into_response();
                 }
@@ -909,26 +1040,22 @@ async fn respond_generation(
             .streaming_requests_total
             .fetch_add(1, Ordering::Relaxed);
         let k = prepared.params.logprobs.unwrap_or(1);
+        let ctx = StreamContext {
+            state,
+            kind,
+            id_prefix,
+            model: &prepared.model,
+            prompt_tokens,
+            k,
+        };
         if prepared.n == 1 {
             stream_response(
-                state,
-                kind,
-                id_prefix,
-                &prepared.model,
-                prompt_tokens,
+                ctx,
                 streams.pop().expect("n == 1 has exactly one stream"),
-                k,
+                guards.pop().expect("n == 1 has exactly one guard"),
             )
         } else {
-            stream_response_multi(
-                state,
-                kind,
-                id_prefix,
-                &prepared.model,
-                prompt_tokens,
-                streams,
-                k,
-            )
+            stream_response_multi(ctx, streams, guards)
         }
     } else if prepared.n == 1 {
         let k = prepared.params.logprobs.unwrap_or(1);
@@ -1179,22 +1306,39 @@ impl StreamKind {
     }
 }
 
+/// 流式响应的公共上下文（把参数数收敛到 clippy 上限内）。
+struct StreamContext<'a> {
+    state: &'a Arc<AppState>,
+    kind: StreamKind,
+    id_prefix: &'a str,
+    model: &'a str,
+    prompt_tokens: usize,
+    k: usize,
+}
+
 /// token 级流式响应：随引擎循环推送的事件逐片段发送，
 /// 首字节延迟 = 首 token 生成时间（而非完整生成时间）。
 fn stream_response(
-    state: &Arc<AppState>,
-    kind: StreamKind,
-    id_prefix: &str,
-    model: &str,
-    prompt_tokens: usize,
+    ctx: StreamContext<'_>,
     mut events: mpsc::UnboundedReceiver<RequestEvent>,
-    k: usize,
+    guard: RequestGuard,
 ) -> Response {
+    let StreamContext {
+        state,
+        kind,
+        id_prefix,
+        model,
+        prompt_tokens,
+        k,
+    } = ctx;
     let id = state.next_id(id_prefix);
     let created = unix_timestamp();
     let model = model.to_string();
     let tokenizer = state.tokenizer.clone();
     Sse::new(stream! {
+        // 持有请求 guard 覆盖流的整个生命周期：client 断开 → stream drop
+        // → guard Drop 置位取消信号，engine loop 下一步检出（主动取消）。
+        let _guard = guard;
         let mut failure: Option<String> = None;
         let mut terminated = false;
         while let Some(event) = events.recv().await {
@@ -1262,20 +1406,26 @@ fn stream_response(
 /// 其余为空占位）；全部候选到达终态后发出终止 chunk（n 个 finish_reason
 /// + 聚合 usage）。任一候选失败 → error chunk 整体失败。
 fn stream_response_multi(
-    state: &Arc<AppState>,
-    kind: StreamKind,
-    id_prefix: &str,
-    model: &str,
-    prompt_tokens: usize,
+    ctx: StreamContext<'_>,
     streams: Vec<mpsc::UnboundedReceiver<RequestEvent>>,
-    k: usize,
+    guards: Vec<RequestGuard>,
 ) -> Response {
+    let StreamContext {
+        state,
+        kind,
+        id_prefix,
+        model,
+        prompt_tokens,
+        k,
+    } = ctx;
     let id = state.next_id(id_prefix);
     let created = unix_timestamp();
     let model = model.to_string();
     let n = streams.len();
     let tokenizer = state.tokenizer.clone();
     Sse::new(stream! {
+        // 全部候选的 guard 随聚合流持有：流结束/drop 时统一取消。
+        let _guards = guards;
         // fan-in：每个候选一个转发任务，事件带候选 index 进入统一通道
         let (tx, mut rx) = mpsc::unbounded_channel::<(usize, RequestEvent)>();
         let mut tasks = JoinSet::new();
@@ -1689,5 +1839,404 @@ mod tests {
             Err(_) => panic!("greedy 参数应通过校验"),
         };
         assert_eq!(params.priority, 0, "缺省 priority 应为 0");
+    }
+
+    // ===== PSRV-P0-001：取消所有权回归 =====
+    //
+    // 直接驱动 engine_loop / admit_submission / cancel_flagged：guard Drop
+    // 置位 watch → 引擎循环下一步检出 → 取消 + 终态排出 + 资源释放。
+    // 事件通道本身是同步屏障（Done 到达时 fail_sequence 已执行、槽位已
+    // 释放），无需 sleep。token 37 = 'A'（SimpleTokenizer 词表内，
+    // 每步产出非空文本片段）。
+
+    use crate::test_utils::{create_test_config, test_params, ConstantTokenExecutor};
+    use crate::{GPUExecutorTrait, Scheduler, SimpleTokenizer};
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    const TEST_TOKEN: crate::types::TokenId = 37; // 'A'
+    const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn loop_engine(config: &EngineConfig, executor: Box<dyn GPUExecutorTrait>) -> InferenceEngine {
+        InferenceEngine::with_components(
+            config.clone(),
+            Box::new(SimpleTokenizer::without_special_tokens()),
+            Scheduler::new(config.clone()),
+            executor,
+        )
+        .expect("test engine must build")
+    }
+
+    /// 绕过 HTTP 层直接驱动引擎循环的测试夹具：
+    /// 真实的 Submission/RequestGuard/Waiter 路径，submit 走 AppState::submit。
+    struct LoopHarness {
+        state: Arc<AppState>,
+        shutdown_tx: watch::Sender<bool>,
+        engine_metrics: Arc<SharedEngineMetrics>,
+        join: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for LoopHarness {
+        fn drop(&mut self) {
+            self.join.abort();
+        }
+    }
+
+    fn spawn_loop(engine: InferenceEngine, config: EngineConfig) -> LoopHarness {
+        let (submit_tx, submit_rx) = mpsc::channel(SUBMISSION_QUEUE_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let engine_metrics = Arc::new(SharedEngineMetrics::default());
+        let join = tokio::spawn(engine_loop(
+            engine,
+            submit_rx,
+            engine_metrics.clone(),
+            shutdown_rx,
+            // 与 create_router_with_engine_and_shutdown 相同：循环自持保活
+            // sender，通道只在显式 send(true) 时置位。
+            shutdown_tx.clone(),
+        ));
+        let state = Arc::new(AppState {
+            config,
+            submit_tx,
+            metrics: Arc::new(ServerMetrics::default()),
+            engine_metrics: engine_metrics.clone(),
+            response_counter: Arc::new(AtomicU64::new(1)),
+            tokenizer: Arc::new(SimpleTokenizer::without_special_tokens()),
+        });
+        LoopHarness {
+            state,
+            shutdown_tx,
+            engine_metrics,
+            join,
+        }
+    }
+
+    async fn submit_ok(
+        state: &Arc<AppState>,
+        prompt: &str,
+        params: GenerationParams,
+    ) -> (
+        Admission,
+        mpsc::UnboundedReceiver<RequestEvent>,
+        RequestGuard,
+    ) {
+        match state.submit(prompt, params).await {
+            Ok(v) => v,
+            Err(_) => panic!("submit must succeed"),
+        }
+    }
+
+    async fn next_event(
+        events: &mut mpsc::UnboundedReceiver<RequestEvent>,
+    ) -> Option<RequestEvent> {
+        timeout(EVENT_TIMEOUT, events.recv())
+            .await
+            .expect("timed out waiting for request event")
+    }
+
+    /// 屏障：等到该请求的第一个 Chunk（说明已进入 decode）。
+    async fn await_chunk(events: &mut mpsc::UnboundedReceiver<RequestEvent>) {
+        match next_event(events).await {
+            Some(RequestEvent::Chunk(..)) => {}
+            Some(RequestEvent::Done(done)) => {
+                panic!("expected chunk, got terminal (success={})", done.success)
+            }
+            None => panic!("event channel closed before any chunk"),
+        }
+    }
+
+    /// 屏障：等到终态 Done。
+    async fn await_done(events: &mut mpsc::UnboundedReceiver<RequestEvent>) -> CompletedRequest {
+        loop {
+            match next_event(events).await {
+                Some(RequestEvent::Done(done)) => return done,
+                Some(RequestEvent::Chunk(..)) => continue,
+                None => panic!("event channel closed without Done"),
+            }
+        }
+    }
+
+    fn assert_cancelled(done: &CompletedRequest) {
+        assert!(!done.success, "cancelled request must not be success");
+        let msg = done.error.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("cancelled"),
+            "expected cancellation reason, got: {msg}"
+        );
+    }
+
+    /// 有界轮询指标快照：引擎循环每步结束刷新 SharedEngineMetrics。
+    async fn await_metric(counter: &AtomicU64, target: u64, what: &str) {
+        for _ in 0..10_000 {
+            if counter.load(Ordering::Relaxed) == target {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("timed out waiting for {what} == {target}");
+    }
+
+    /// guard Drop → decode 中请求被主动取消：终态恰好一次、原因含
+    /// cancelled、序列槽位释放（Done 到达即已释放）。
+    #[tokio::test]
+    async fn cancel_decode_request_via_guard_drop() {
+        let config = create_test_config();
+        let harness = spawn_loop(
+            loop_engine(
+                &config,
+                Box::new(ConstantTokenExecutor { token: TEST_TOKEN }),
+            ),
+            config,
+        );
+        let (admission, mut events, guard) =
+            submit_ok(&harness.state, "hello", test_params(1000)).await;
+        await_chunk(&mut events).await; // 已进入 decode
+
+        drop(guard);
+        let done = await_done(&mut events).await;
+        assert_eq!(done.request_id, admission.request_id);
+        assert_cancelled(&done);
+        // 恰好一次终态：Done 之后 waiter 移除、发送端 drop，通道关闭。
+        assert!(next_event(&mut events).await.is_none());
+        await_metric(
+            &harness.engine_metrics.active_sequences,
+            0,
+            "active_sequences",
+        )
+        .await;
+        drop(harness);
+    }
+
+    /// guard Drop → pending 中请求被取消：不产生任何 token、终态正常排出。
+    #[tokio::test]
+    async fn cancel_pending_request_via_guard_drop() {
+        // batch=1 + 长 decode 占用者：第二个请求永远停在 pending。
+        let mut config = create_test_config();
+        config.max_batch_size = 1;
+        let harness = spawn_loop(
+            loop_engine(
+                &config,
+                Box::new(ConstantTokenExecutor { token: TEST_TOKEN }),
+            ),
+            config,
+        );
+        let (_adm_a, mut events_a, guard_a) =
+            submit_ok(&harness.state, "hog", test_params(1000)).await;
+        await_chunk(&mut events_a).await; // A 已进入 decode，占住每步唯一 batch 槽
+
+        let (_adm_b, mut events_b, guard_b) =
+            submit_ok(&harness.state, "pending", test_params(8)).await;
+        drop(guard_b);
+        let done_b = await_done(&mut events_b).await;
+        assert_cancelled(&done_b);
+        assert!(
+            done_b.output_tokens.is_empty(),
+            "pending-stage cancel must not produce tokens"
+        );
+
+        // A 不受影响，仍在产出片段（无串扰）。
+        await_chunk(&mut events_a).await;
+        drop(guard_a);
+        assert_cancelled(&await_done(&mut events_a).await);
+        drop(harness);
+    }
+
+    /// 排队期 owner 消失 → 准入预检跳过：不分配调度/KV 资源。
+    /// 同时覆盖 `has_changed()` 的 Err 分支（sender 全 drop）。
+    #[tokio::test]
+    async fn admission_precheck_skips_cancelled_submission() {
+        let config = create_test_config();
+        let mut engine = loop_engine(
+            &config,
+            Box::new(ConstantTokenExecutor { token: TEST_TOKEN }),
+        );
+        let mut waiters: HashMap<RequestId, Waiter> = HashMap::new();
+        let (admit_tx, mut admit_rx) = oneshot::channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        // 等价于 guard Drop：sender 消失即 owner 消失。
+        drop(cancel_tx);
+
+        admit_submission(
+            &mut engine,
+            Submission {
+                prompt: "x".to_string(),
+                params: test_params(4),
+                admit: admit_tx,
+                events: events_tx,
+                cancel: cancel_rx,
+            },
+            &mut waiters,
+        );
+
+        assert!(
+            waiters.is_empty(),
+            "cancelled submission must not get a waiter"
+        );
+        assert!(
+            !engine.has_pending_work(),
+            "cancelled submission must not allocate a sequence"
+        );
+        // admit 回执被丢弃：sender 已 drop，对端收 Closed。
+        assert!(matches!(
+            admit_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    /// cancel_flagged 单元级：pending 态请求被取消、终态排出、waiter 移除。
+    #[tokio::test]
+    async fn cancel_flagged_dispatches_terminal_for_pending() {
+        let config = create_test_config();
+        let mut engine = loop_engine(
+            &config,
+            Box::new(ConstantTokenExecutor { token: TEST_TOKEN }),
+        );
+        let (request_id, _prompt_tokens) = engine
+            .submit_request("hello", test_params(8))
+            .expect("admission must succeed"); // Pending：从未 step
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let guard = RequestGuard { cancel: cancel_tx };
+        let mut waiters = HashMap::new();
+        waiters.insert(
+            request_id,
+            Waiter {
+                events: events_tx,
+                cancel: cancel_rx,
+                cancelled: false,
+            },
+        );
+        let (_shutdown_keepalive, shutdown_rx) = watch::channel(false);
+
+        drop(guard);
+        cancel_flagged(&mut engine, &mut waiters, &shutdown_rx);
+
+        assert!(waiters.is_empty(), "terminal dispatch must remove waiter");
+        let done = await_done(&mut events_rx).await;
+        assert_eq!(done.request_id, request_id);
+        assert_cancelled(&done);
+        assert_eq!(engine.get_metrics().active_sequences, 0);
+        assert!(!engine.has_pending_work());
+    }
+
+    /// shutdown 广播：全部在途请求被取消，终态逐一排出。
+    #[tokio::test]
+    async fn shutdown_broadcast_cancels_all_inflight() {
+        let config = create_test_config();
+        let harness = spawn_loop(
+            loop_engine(
+                &config,
+                Box::new(ConstantTokenExecutor { token: TEST_TOKEN }),
+            ),
+            config,
+        );
+        let (_adm_a, mut events_a, _guard_a) =
+            submit_ok(&harness.state, "a", test_params(1000)).await;
+        let (_adm_b, mut events_b, _guard_b) =
+            submit_ok(&harness.state, "b", test_params(1000)).await;
+        await_chunk(&mut events_a).await;
+        await_chunk(&mut events_b).await;
+
+        harness.shutdown_tx.send(true).expect("loop alive");
+
+        assert_cancelled(&await_done(&mut events_a).await);
+        assert_cancelled(&await_done(&mut events_b).await);
+        await_metric(
+            &harness.engine_metrics.active_sequences,
+            0,
+            "active_sequences",
+        )
+        .await;
+        drop(harness);
+    }
+
+    /// 无跨请求串扰：取消 A 不影响 B 正常完成。
+    #[tokio::test]
+    async fn cancelling_one_request_does_not_affect_others() {
+        let config = create_test_config();
+        let harness = spawn_loop(
+            loop_engine(
+                &config,
+                Box::new(ConstantTokenExecutor { token: TEST_TOKEN }),
+            ),
+            config,
+        );
+        let (_adm_a, mut events_a, guard_a) =
+            submit_ok(&harness.state, "long", test_params(1000)).await;
+        let (_adm_b, mut events_b, _guard_b) =
+            submit_ok(&harness.state, "short", test_params(2)).await;
+        await_chunk(&mut events_a).await;
+        await_chunk(&mut events_b).await;
+
+        drop(guard_a);
+        assert_cancelled(&await_done(&mut events_a).await);
+
+        let done_b = await_done(&mut events_b).await;
+        assert!(done_b.success, "sibling request must complete normally");
+        drop(harness);
+    }
+
+    /// n>1 部分准入失败：已准入候选被显式取消且槽位立即释放。
+    /// Done 到达时 fail_sequence 已执行——新请求立即准入成功即证明。
+    #[tokio::test]
+    async fn partial_admission_failure_releases_admitted_candidate() {
+        let mut config = create_test_config();
+        config.max_num_seqs = 1;
+        config.max_batch_size = 1; // 同步收紧：满足 validate 关系校验
+        let harness = spawn_loop(
+            loop_engine(
+                &config,
+                Box::new(ConstantTokenExecutor { token: TEST_TOKEN }),
+            ),
+            config,
+        );
+        // 候选 1 准入并占住唯一序列槽。
+        let (_adm1, mut events1, guard1) =
+            submit_ok(&harness.state, "first", test_params(1000)).await;
+        await_chunk(&mut events1).await;
+
+        // 候选 2 准入必然失败（并发上限）。
+        match harness.state.submit("second", test_params(8)).await {
+            Err(ApiError::Overloaded(_)) => {}
+            _ => panic!("candidate 2 must fail admission with Overloaded"),
+        }
+
+        // respond_generation 的对应动作：drop 已收集 guard → 主动取消。
+        drop(guard1);
+        assert_cancelled(&await_done(&mut events1).await);
+
+        // Done 到达 = 槽位已释放：新请求必须立即准入并正常完成。
+        let (_adm3, mut events3, _guard3) =
+            submit_ok(&harness.state, "third", test_params(2)).await;
+        assert!(await_done(&mut events3).await.success);
+        drop(harness);
+    }
+
+    /// 终态后 drop guard 是无害 no-op：waiter 已移除、id 不复用，
+    /// 后续请求不受影响。
+    #[tokio::test]
+    async fn guard_drop_after_completion_is_harmless() {
+        let config = create_test_config();
+        let harness = spawn_loop(
+            loop_engine(
+                &config,
+                Box::new(ConstantTokenExecutor { token: TEST_TOKEN }),
+            ),
+            config,
+        );
+        let (_adm, mut events, guard) = submit_ok(&harness.state, "done", test_params(1)).await;
+        assert!(await_done(&mut events).await.success);
+
+        drop(guard); // 终态后 drop：不得产生幻影失败
+        let (_adm2, mut events2, _guard2) = submit_ok(&harness.state, "next", test_params(1)).await;
+        assert!(await_done(&mut events2).await.success);
+        await_metric(
+            &harness.engine_metrics.failed_requests,
+            0,
+            "failed_requests",
+        )
+        .await;
+        drop(harness);
     }
 }

@@ -426,7 +426,11 @@ async fn run_request(
     let (ok, error_class, error_detail) = if let Some((class, message)) = &stream_failure {
         (false, Some(class.clone()), Some(message.clone()))
     } else if !saw_done {
-        (false, Some("no_done".to_string()), None)
+        (
+            false,
+            Some("no_done".to_string()),
+            Some("SSE stream ended without [DONE]".to_string()),
+        )
     } else {
         (true, None, None)
     };
@@ -507,8 +511,15 @@ fn poisson_interval_secs(rng: &mut impl Rng, rate: f64) -> f64 {
 }
 
 fn build_summary(records: &[RequestRecord], wall_secs: f64, args: &Args) -> RunSummary {
-    let total = records.len();
-    let ok_records: Vec<&RequestRecord> = records.iter().filter(|r| r.ok).collect();
+    // warmup 记录（measured_index = null）不进正式 summary。main 本就不会把
+    // warmup 结果 push 进 records，这里把该不变量固化在聚合入口，防止未来
+    // 调用方误传。
+    let measured: Vec<&RequestRecord> = records
+        .iter()
+        .filter(|r| r.measured_index.is_some())
+        .collect();
+    let total = measured.len();
+    let ok_records: Vec<&RequestRecord> = measured.iter().copied().filter(|r| r.ok).collect();
     let ok = ok_records.len();
 
     let ttfts = ok_records.iter().filter_map(|r| r.ttft_ms).collect();
@@ -546,7 +557,7 @@ fn build_summary(records: &[RequestRecord], wall_secs: f64, args: &Args) -> RunS
 
     // 失败归类计数
     let mut error_counts: BTreeMap<String, usize> = Default::default();
-    for r in records.iter().filter(|r| !r.ok) {
+    for r in measured.iter().filter(|r| !r.ok) {
         *error_counts
             .entry(r.error_class.clone().unwrap_or_else(|| "unknown".into()))
             .or_insert(0) += 1;
@@ -987,6 +998,372 @@ mod tests {
             finish_reason: Some("length".to_string()),
             prompt_tokens_meta: Some(4),
         }
+    }
+
+    fn failure_record_with(class: &str) -> RequestRecord {
+        RequestRecord {
+            request_id: 0,
+            measured_index: Some(0),
+            ok: false,
+            error_class: Some(class.to_string()),
+            error_detail: Some("detail".to_string()),
+            ttft_ms: None,
+            inter_chunk_latency_ms: Vec::new(),
+            duration_ms: 5.0,
+            chunks: 0,
+            completion_tokens: None,
+            tokens_source: None,
+            finish_reason: None,
+            prompt_tokens_meta: None,
+        }
+    }
+
+    // ---- 真实 HTTP/SSE 回归：本地一次性 server ----
+    // 用 std::net 而非 tokio::net：本 crate 未启用 tokio "net" feature，
+    // 测试 server 只需阻塞写若干字节。
+
+    /// 读完一个 HTTP 请求（headers + Content-Length body）。若未消费请求体
+    /// 就提前写响应并关连接，client 可能先读到 RST 而非响应。
+    fn read_http_request(stream: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+            let content_length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            let body_end = header_end + 4 + content_length;
+            while buf.len() < body_end {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            return;
+        }
+    }
+
+    /// 启动一次性测试 server：accept 一个连接 → 读请求 → 执行 respond
+    /// （写完整响应，或模拟故障如不响应）。返回 (base_url, join)。
+    fn spawn_server(
+        respond: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let port = listener.local_addr().unwrap().port();
+        let join = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            read_http_request(&mut stream);
+            respond(&mut stream);
+        });
+        (format!("http://127.0.0.1:{port}"), join)
+    }
+
+    /// 最小 HTTP 响应。Connection: close 且不带长度 → body 以 EOF 结束，
+    /// 与 SSE 流式语义一致（服务端发完即关）。
+    fn http_response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// LF 分隔的 SSE 响应体，每个元素一个 `data:` event。
+    fn sse_response(events: &[&str]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for event in events {
+            body.extend_from_slice(b"data: ");
+            body.extend_from_slice(event.as_bytes());
+            body.extend_from_slice(b"\n\n");
+        }
+        http_response("200 OK", "text/event-stream", &body)
+    }
+
+    fn test_entry() -> DatasetEntry {
+        DatasetEntry {
+            prompt: "hello".to_string(),
+            prompt_tokens: Some(2),
+        }
+    }
+
+    /// 对一次性 server 执行一次真实 run_request，返回聚合后的 record。
+    async fn run_against(response: Vec<u8>, mut args: Args) -> RequestRecord {
+        let (base_url, join) = spawn_server(move |stream| {
+            use std::io::Write;
+            let _ = stream.write_all(&response);
+            let _ = stream.flush();
+        });
+        args.base_url = base_url;
+        let rec = run_request(
+            &reqwest::Client::new(),
+            &args,
+            0,
+            Some(0),
+            &test_entry(),
+            None,
+        )
+        .await;
+        join.join().expect("test server thread");
+        rec
+    }
+
+    #[tokio::test]
+    async fn run_request_success_with_usage_over_real_http() {
+        let rec = run_against(
+            sse_response(&[
+                "{\"choices\":[{\"text\":\"Hel\",\"finish_reason\":null}]}",
+                "{\"choices\":[{\"text\":\"lo\",\"finish_reason\":null}]}",
+                "{\"choices\":[{\"text\":\"\",\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":7}}",
+                "[DONE]",
+            ]),
+            test_args(),
+        )
+        .await;
+        assert!(rec.ok, "unexpected failure: {:?}", rec.error_class);
+        assert_eq!(rec.chunks, 2);
+        assert_eq!(rec.completion_tokens, Some(7));
+        assert_eq!(rec.tokens_source.as_deref(), Some("usage"));
+        assert_eq!(rec.finish_reason.as_deref(), Some("stop"));
+        assert!(rec.ttft_ms.is_some());
+        assert_eq!(rec.inter_chunk_latency_ms.len(), 1);
+        assert!(rec.error_class.is_none() && rec.error_detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_request_accepts_crlf_sse_end_to_end() {
+        let body = b"data: {\"choices\":[{\"text\":\"hi\",\"finish_reason\":\"stop\"}]}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let rec = run_against(
+            http_response("200 OK", "text/event-stream", body),
+            test_args(),
+        )
+        .await;
+        assert!(rec.ok, "unexpected failure: {:?}", rec.error_class);
+        assert_eq!(rec.chunks, 1);
+        assert_eq!(rec.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn run_request_handles_utf8_split_across_tcp_writes() {
+        let (base_url, join) = spawn_server(|stream| {
+            use std::io::Write;
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            // "你" = E4 BD A0；首字节单独发出，模拟网络 chunk 切在多字节
+            // 字符中间。缓冲层若按到达边界解码会产生 protocol_error。
+            let _ = stream.write_all(b"data: {\"choices\":[{\"text\":\"\xE4");
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(30));
+            let _ =
+                stream.write_all(b"\xBD\xA0\",\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+            let _ = stream.flush();
+        });
+        let mut args = test_args();
+        args.base_url = base_url;
+        let rec = run_request(
+            &reqwest::Client::new(),
+            &args,
+            0,
+            Some(0),
+            &test_entry(),
+            None,
+        )
+        .await;
+        join.join().expect("test server thread");
+        assert!(rec.ok, "split UTF-8 must not fail: {:?}", rec.error_class);
+        assert_eq!(rec.chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn run_request_classifies_http_error_statuses() {
+        for (status, expected) in [
+            ("429 Too Many Requests", "http_429"),
+            ("400 Bad Request", "http_4xx"),
+            ("500 Internal Server Error", "http_5xx"),
+        ] {
+            let rec = run_against(
+                http_response(status, "application/json", b"{\"error\":\"x\"}"),
+                test_args(),
+            )
+            .await;
+            assert!(!rec.ok, "{status} must fail");
+            assert_eq!(rec.error_class.as_deref(), Some(expected));
+            assert!(
+                rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()),
+                "{expected} must keep non-empty detail"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_classifies_connection_refused() {
+        // 绑定后立即释放端口，得到确定性的"无监听者"地址。
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut args = test_args();
+        args.base_url = format!("http://127.0.0.1:{port}");
+        let rec = run_request(
+            &reqwest::Client::new(),
+            &args,
+            0,
+            Some(0),
+            &test_entry(),
+            None,
+        )
+        .await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("connection"));
+        assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn run_request_classifies_timeout() {
+        let (base_url, _join) = spawn_server(|_stream| {
+            // 读完请求后保持连接不响应；客户端 1s 超时先触发。
+            // 不 join：server 线程睡完即退，与测试无共享状态。
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let mut args = test_args();
+        args.base_url = base_url;
+        args.timeout_secs = 1;
+        let rec = run_request(
+            &reqwest::Client::new(),
+            &args,
+            0,
+            Some(0),
+            &test_entry(),
+            None,
+        )
+        .await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("timeout"));
+        assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn run_request_classifies_invalid_json_as_protocol_error() {
+        let rec = run_against(sse_response(&["{not json}", "[DONE]"]), test_args()).await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("protocol_error"));
+        assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn run_request_classifies_invalid_utf8_as_protocol_error() {
+        let mut body = b"data: ".to_vec();
+        body.extend_from_slice(&[0xFF, 0xFE]);
+        body.extend_from_slice(b"\n\n");
+        let rec = run_against(
+            http_response("200 OK", "text/event-stream", &body),
+            test_args(),
+        )
+        .await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("protocol_error"));
+        assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn run_request_classifies_error_frame_as_stream_error() {
+        let rec = run_against(
+            sse_response(&[
+                "{\"choices\":[{\"text\":\"x\",\"finish_reason\":null}]}",
+                "{\"error\":{\"message\":\"engine overloaded\"}}",
+                "[DONE]",
+            ]),
+            test_args(),
+        )
+        .await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("stream_error"));
+        // 服务端错误消息透传为 detail（样例 record 保留非空 detail）。
+        assert_eq!(rec.error_detail.as_deref(), Some("engine overloaded"));
+    }
+
+    #[tokio::test]
+    async fn run_request_classifies_missing_done_as_failure() {
+        let rec = run_against(
+            sse_response(&["{\"choices\":[{\"text\":\"x\",\"finish_reason\":null}]}"]),
+            test_args(),
+        )
+        .await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("no_done"));
+        assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn run_request_without_usage_leaves_token_count_unknown() {
+        let rec = run_against(
+            sse_response(&[
+                "{\"choices\":[{\"text\":\"hi\",\"finish_reason\":\"stop\"}]}",
+                "[DONE]",
+            ]),
+            test_args(),
+        )
+        .await;
+        assert!(rec.ok);
+        // 无 usage 且无 tokenizer → token 数未知，coverage 不完整时汇总层
+        // 不得产出 tok/s。
+        assert_eq!(rec.completion_tokens, None);
+        assert_eq!(rec.tokens_source, None);
+        let summary = build_summary(&[rec], 1.0, &test_args());
+        assert_eq!(summary.requests.success, 1);
+        assert_eq!(summary.completion_tokens.known_requests, 0);
+        assert_eq!(summary.completion_tokens.coverage_pct, 0.0);
+        assert!(summary.throughput.output_tokens_per_second.is_none());
+    }
+
+    #[test]
+    fn summary_excludes_warmup_records() {
+        let args = test_args();
+        let measured = successful_record(Some(4));
+        let mut warmup = successful_record(Some(4));
+        warmup.measured_index = None;
+        let summary = build_summary(&[measured, warmup], 1.0, &args);
+        assert_eq!(summary.requests.total, 1);
+        assert_eq!(summary.requests.success, 1);
+        assert_eq!(summary.completion_tokens.known_requests, 1);
+        assert_eq!(summary.completion_tokens.total, 4);
+    }
+
+    #[test]
+    fn summary_aggregates_error_classes() {
+        let args = test_args();
+        let summary = build_summary(
+            &[
+                failure_record_with("no_done"),
+                failure_record_with("no_done"),
+                failure_record_with("http_429"),
+            ],
+            1.0,
+            &args,
+        );
+        assert_eq!(summary.requests.total, 3);
+        assert_eq!(summary.requests.failed, 3);
+        assert_eq!(summary.requests.success, 0);
+        assert_eq!(summary.errors.get("no_done"), Some(&2));
+        assert_eq!(summary.errors.get("http_429"), Some(&1));
     }
 
     #[test]

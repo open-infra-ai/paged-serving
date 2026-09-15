@@ -115,7 +115,7 @@ received → admitted → pending → prefill → decode → completed | failed 
 | 多 chunk 后断开 | 被动 send-failure → cancel（已测） | 主动 token + 保留 send-failure 兜底 |
 | unary handler abort | `generate()` future drop → rx drop → 被动 | rx 由 guard 持有，guard Drop 发 cancel |
 | `n>1` 第 k 个准入失败 | `return err` → 已准入 stream drop → 被动 | 对已准入 token 显式 `cancel()` 后返回 |
-| server shutdown | graceful drain，未定义超时 | drain 期内 engine loop 继续；guard 随连接 drop |
+| server shutdown | graceful drain 只在途自然完成，SSE 流可任意长 → shutdown 可无限挂起（**原稿"guard 随连接 drop"有误**：graceful shutdown 不主动 drop 连接） | shutdown 信号 → engine loop 广播取消全部在途请求（`Done{cancelled}`），流终止、连接关闭，排空有界 |
 | engine/backend error | `Failed` 终态 + Done（已有） | 不变 |
 | request timeout | 不存在 | 若未来加入，走同一 cancel 路径 |
 | channel overflow | 不存在（unbounded） | overflow → 对该请求发 cancel + Done(cancelled)，
@@ -124,21 +124,43 @@ received → admitted → pending → prefill → decode → completed | failed 
 **机制**：`Submission` 新增 `cancel: watch::Receiver<bool>`（初始 false）。
 handler 侧 `RequestGuard { cancel_tx }` 实现 `Drop → let _ = tx.send(true)`。
 engine loop 在 `step_events` 前后各检查一次 `waiters` 中
-`rx.has_changed() == Ok(true)` 的请求 → `cancel_request` + `waiters.remove`。
-保留 `tx.send().is_err()` 检测作为兜底（rx 被 drop 但 guard 未覆盖的路径）。
+`rx.has_changed()` 的请求。**判定口径：`has_changed() != Ok(false)` 即取消**
+——`Ok(true)` 为显式 cancel，`Err` 为 sender 全部 drop（owner 已消失，
+同样必须取消，覆盖 guard 未正常触发 cancel 的异常路径）。
+`admit_submission` 前也检查一次：submission 排队期间已断连的请求不再准入，
+省一次 prefill 分配。保留 `tx.send().is_err()` 检测作为兜底
+（rx 被 drop 但 guard 未覆盖的路径）。
+
+**post-terminal 安全性**：Done 投递后 guard Drop 仍会 `send(true)`——
+此时 waiter 已移除、`cancel_by_request_id` 返回 false，是无害 no-op。
+request_id 不复用，无串扰。
 
 `watch` 语义：单值、覆盖式、多 receiver 可观察；n>1 每候选独立 token。
 `CancellationToken`（tokio-util）等价但引入新依赖——选 `watch`（现有
 tokio "sync" feature 已含）。
 
+**shutdown 广播**：`main` 持有一个 engine 级 `watch::Sender<bool>`；
+`shutdown_signal()` 触发后置位。engine loop 检出后遍历 `waiters`
+全部 `cancel_request` + 投递 `Done{cancelled}`，SSE 流随即终止、连接
+关闭，axum graceful drain 因而有界（不再被任意长的流挂起）。
+
 ## 5. Bounded channel 策略（§7.3）
 
 | channel | capacity | element 上界 | producer 可否 await | overflow 行为 | 全局影响 |
 |---|---|---|---|---|---|
-| engine → 单请求 | `config.event_channel_capacity`，默认 64 | `Chunk`：单步 detok 文本（≪1KB）+ logprobs | **否**（`try_send`，engine loop 不得阻塞） | `Full` → cancel 该请求，发 `Done{cancelled}` | 慢消费者只丢自己 |
-| n>1 child → fan-in | `n × event_channel_capacity` | 同上 + usize index | **可**（专用转发 task，`send().await`） | 上游 mailbox 先溢出 → child 被 cancel → task 退出 | 背压逐候选传导 |
-| submission queue | 1024（现状，冻结） | `Submission` 定长 | 可（handler await = 准入延迟） | 队列满 → `send().await` 背压到 handler | 客户端看到 429 前兆由准入层管 |
+| engine → 单请求 chunk | `config.event_channel_capacity`，默认 64 | `Chunk`：单步 detok 文本（≪1KB）+ logprobs | **否**（`try_send`，engine loop 不得阻塞） | `Full` → cancel 该请求（见下方终态通道） | 慢消费者只丢自己 |
+| engine → 单请求 **终态** | `oneshot`（恰 1 条，固有上界） | `CompletedRequest` 定长 | 否（`send`，永不阻塞/拒绝） | 不可能 overflow | 终态必达 |
+| n>1 child → fan-in | `n × event_channel_capacity` | chunk/Done 标记 + usize index | **可**（专用转发 task，`send().await`） | 上游 mailbox 先溢出 → child 被 cancel → task 退出 | 背压逐候选传导 |
+| submission queue | 1024（现状，冻结） | `Submission` 定长 | 可（handler await = 准入延迟） | 队列满 → `send().await` 背压到 handler（engine stall 时 handler 悬挂而非 429——记录为已知行为，准入层 overload→429 仍发生在 admit 点） | — |
 | metrics sampler（P1-003 预留） | 1（`watch`/`latest`） | 快照定长 | 否 | coalesce（只保留最新） | 无背压 |
+
+**终态带外通道（评审修订）**：`Done` 不能与 `Chunk` 共用有界 mailbox——
+overflow-cancel 时 mailbox 已满，`try_send(Done)` 同样失败，client 只会
+观察到 sender-drop 得到泛化错误而非精确终态。waiter 改为
+`{ events_tx: mpsc::Sender<Chunk>, done_tx: oneshot::Sender<CompletedRequest>,
+cancel_rx }`；`dispatch_completed` 与 overflow-cancel 均经 `done_tx` 投递
+（oneshot 单发，无背压问题；send 失败即 receiver 已 drop，静默丢弃同现状）。
+SSE/转发侧对 `events` 与 `done` `select!`；done 到达后忽略残余 chunk。
 
 - **失败终态形状**：overflow-cancel 的 Done 携带 `cancelled: true` +
   `error = "slow consumer: event channel overflow"`；SSE 端收到 error
@@ -154,12 +176,12 @@ tokio "sync" feature 已含）。
 
 | 问题 | 冻结口径 |
 |---|---|
-| `inflight` 含义 | HTTP handler lifetime（`InflightGuard` 现状，冻结）；注释/HELP 写明 |
+| `inflight` 含义 | **response body lifetime**（修订）：现状 `InflightGuard` 随 handler future 返回即 drop，而流式路径构建 SSE stream 后不 await 生成——gauge 对在途 streaming 恒不计数。改为流式把 guard 移入 stream 体内（stream 结束/drop 时递减）、unary 维持 handler 作用域；统一语义 = "请求仍在被服务"。指标名不变，HELP 写明 |
 | `requests_total` 对 n | 一个 API request 计 1（不乘 n） |
 | malformed JSON | **计** `errors_total`（现状不计 → 修，breaking 记录 CHANGELOG） |
 | 429 / admission failure | 计 `errors_total`（现状已计，冻结） |
 | SSE terminal error | 计 `errors_total`（generation failure 路径已计） |
-| cancelled vs failed | 独立：`paged_requests_cancelled_total` 新增 counter |
+| cancelled vs failed | 独立：`paged_requests_cancelled_total` 新增 counter；cancelled **不计入** `errors_total`（client 主动行为非服务故障） |
 | active_sequences / KV | engine loop 每步结束后快照（现状，冻结时点） |
 | HELP 文本 | 每个指标补 `# HELP` 行，单位精确到 request/token/ratio |
 
@@ -205,3 +227,16 @@ tokio "sync" feature 已含）。
    ~64 step 抖动缓冲；可调。
 3. overflow 终态 error 文案与 `type` 字段值（`internal_error` vs
    新 `cancelled` 类型）——影响 API 可观察面，需冻结。
+
+## 10. 评审修订记录（self-review 2026-09-15）
+
+1. **终态带外通道**：`Done` 原设计与 `Chunk` 共用有界 mailbox——
+   overflow-cancel 时 mailbox 已满、终态无法投递。改为 `oneshot` 终态
+   通道（§5）。
+2. **`inflight` 口径修正**：原冻结 handler lifetime 对流式恒不计数；
+   改为 response body lifetime（§6）。
+3. **shutdown 语义**：原稿误称"guard 随连接 drop"——graceful shutdown
+   不主动断开连接，长 SSE 会使 shutdown 无限挂起。改为 shutdown 信号
+   广播 cancel-all（§4 触发表）。
+4. **`watch` Err 分支**：`has_changed()` 在 sender 全 drop 时返回 `Err`；
+   冻结为 `!= Ok(false)` 即取消，覆盖 guard 异常路径（§4）。

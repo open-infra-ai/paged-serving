@@ -5,8 +5,8 @@ use log::info;
 #[cfg(feature = "tiny-llm")]
 use paged_serving::{build_tokenizer, Scheduler, TinyLlmExecutor};
 use paged_serving::{
-    create_router_with_engine, EngineConfig, GenerationParams, InferenceEngine, TokenizerConfig,
-    TokenizerKind,
+    create_router_with_engine_and_shutdown, EngineConfig, GenerationParams, InferenceEngine,
+    TokenizerConfig, TokenizerKind,
 };
 use std::path::{Path, PathBuf};
 
@@ -223,9 +223,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Backend: {:?}", args.backend);
 
         let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-        let app = create_router_with_engine(config, engine)?;
+        let (app, shutdown_trigger) = create_router_with_engine_and_shutdown(config, engine)?;
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                // 广播引擎循环取消全部在途请求：graceful shutdown 不主动
+                // 断开连接，没有 cancel-all 时长 SSE 流会使排空无限挂起。
+                let _ = shutdown_trigger.send(true);
+            })
             .await?;
         info!("Server shut down gracefully");
         return Ok(());

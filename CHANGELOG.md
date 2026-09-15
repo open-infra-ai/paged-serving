@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- 请求取消与有界背压设计包（`docs/architecture/cancellation-backpressure-design.md`）：
+  冻结 request 状态机所有权表、主动取消触发矩阵、四条 channel 的容量与
+  overflow 策略、指标语义口径与测试方式；待评审后分 PR 实现（P0-001/002/003）。
+
 ### Fixed
 - 服务端不再因仅启用 `tiny-llm` 编译 feature 就被误认为正在使用真实 CUDA
   后端：新增显式 `--backend tiny-llm --model-path <model.gguf>` 运行时选择，并在

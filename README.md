@@ -7,7 +7,7 @@
 [![CI](https://github.com/open-infra-ai/paged-serving/actions/workflows/ci.yml/badge.svg)](https://github.com/open-infra-ai/paged-serving/actions/workflows/ci.yml)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
 
 **面向学习与验证的 LLM Serving 控制面：Paged KV 调度、Continuous Batching 与 OpenAI API**
 
@@ -151,7 +151,7 @@ Paged-Serving 是一个基于 Rust 构建的 LLM Serving 控制面，以模块�
 
 ### 环境要求
 
-- **Rust 1.82+** (2021 edition)
+- **Rust 1.88+** (2021 edition；以 `Cargo.lock` 为复现依赖集，CI 在 1.88.0 验证全部默认目标)
 - **Linux** (推荐 Ubuntu 20.04+) 或 **macOS**
 
 ### 安装

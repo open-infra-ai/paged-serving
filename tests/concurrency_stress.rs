@@ -50,7 +50,7 @@ impl GPUExecutorTrait for PeriodicFailExecutor {
             return Ok(ExecutionOutput::default());
         }
         self.counter += 1;
-        if self.counter % self.fail_mod == 0 {
+        if self.counter.is_multiple_of(self.fail_mod) {
             return Err(EngineError::KernelLaunchFailed(
                 "injected periodic failure".to_string(),
             ));

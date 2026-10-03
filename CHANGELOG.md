@@ -8,11 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- 请求 guard 主动取消、shutdown 广播与每候选有界文本 mailbox（默认 64、可配）；
+  终态经独立 oneshot 投递，多候选直接拉取合并，CPU 测试覆盖静默 decode 断连、
+  handler abort、部分准入、慢消费者、末步投递失败和 backend 回收。
 - 请求取消与有界背压设计包（`docs/architecture/cancellation-backpressure-design.md`）：
   冻结 request 状态机所有权表、主动取消触发矩阵、四条 channel 的容量与
   overflow 策略、指标语义口径与测试方式；待评审后分 PR 实现（P0-001/002/003）。
 
 ### Fixed
+- 成功 SSE 终态先排空文本；满队列和末步投递失败返回错误而非伪装完整成功。
+  `paged_inflight_requests` 覆盖 SSE body lifetime，而不在 handler 返回时提前递减。
 - 服务端不再因仅启用 `tiny-llm` 编译 feature 就被误认为正在使用真实 CUDA
   后端：新增显式 `--backend tiny-llm --model-path <model.gguf>` 运行时选择，并在
   feature、后端与模型参数不匹配时直接报错，避免性能实验静默落到 CPU reference。
@@ -21,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte-fallback 边界；中间片段与最终一次性 decode 保持严格等价。
 
 ### Changed
+- `EngineConfig` 新增 `event_channel_capacity`，旧 JSON 缺省为 64；Rust 全字段构造需
+  补字段或使用 `..Default::default()`。`EngineError` 新增 `ShuttingDown`、`ConfigError`
+  新增 `InvalidEventChannelCapacity`（穷尽匹配需更新），
+  C ABI 不变。修复分支执行 locked MSRV 与 stable CI；取消独立状态/指标仍待实现。
 - README 与 serving benchmark 操作手册同步真实后端启动命令；`build.rs` 不再监听
   仅供测试使用、不会改变链接产物的 `TINY_LLM_MODEL` 环境变量。
 - 归档首份真实 CUDA serving 结果（21 个 run、原始请求、模型 SHA-256、硬件与

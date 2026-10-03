@@ -63,6 +63,9 @@ pub enum ConfigError {
     #[error("无效的 max_total_tokens: 必须大于 0，实际值为 {0}")]
     InvalidMaxTotalTokens(u32),
 
+    #[error("无效的 event_channel_capacity: 必须大于 0，实际值为 {0}")]
+    InvalidEventChannelCapacity(u32),
+
     /// 无效的 memory_threshold：必须在 (0.0, 1.0] 范围内，实际值为 {0}
     #[error("无效的 memory_threshold: 必须在 (0.0, 1.0] 范围内，实际值为 {0}")]
     InvalidMemoryThreshold(f32),
@@ -178,6 +181,9 @@ pub enum EngineError {
     /// 计算后端错误：{0}
     #[error("计算后端错误: {0}")]
     BackendError(String),
+
+    #[error("server shutting down")]
+    ShuttingDown,
 
     /// GPU 超时
     #[error("GPU 超时")]

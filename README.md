@@ -40,6 +40,7 @@ Paged-Serving 是一个基于 Rust 构建的 LLM Serving 控制面，以模块�
 | **内存压力感知** | 可配置的 OOM 防护 | ✅ |
 | **模块化架构** | 基于 Trait 的抽象设计 | ✅ |
 | **OpenAI 兼容服务器** | `/v1/completions` + `/v1/chat/completions` + SSE | ✅ |
+| **取消与有界文本队列** | 请求 guard 主动取消；每候选 mailbox + 带外终态；多候选直接拉取合并，CPU 失败回收测试覆盖 | ✅ |
 | **自动化验证** | unit、integration、server integration 与 property tests | ✅ |
 | **tiny-llm 真实后端** | `tiny-llm` feature 下接入 CUDA 后端，分页 KV（策略 1）默认启用，`PAGED_SERVING_TINY_LLM_STRATEGY=2` 可回退连续 KV；正常 greedy 把各序列末层 hidden 写入 GPU batch buffer，再批量执行 final RMSNorm、LM head 与 argmax，并一次回传整批结果；Transformer layer 仍逐序列；`PAGED_SERVING_TINY_LLM_MAX_SEQS`（默认 4）与 `PAGED_SERVING_TINY_LLM_DECODE_RESERVE`（默认 512）可按显存/生成长度调节容量 | ✅ |
 
@@ -147,6 +148,26 @@ Paged-Serving 是一个基于 Rust 构建的 LLM Serving 控制面，以模块�
 - 任何终止路径（完成 / 取消 / 失败 / 客户端断开）都归还 KV 块，内存利用率
   回到基线 —— 由穷举属性测试覆盖
 
+### 取消与慢客户端
+
+`RequestGuard` 随 unary future / SSE body 持有，退出时发送取消信号；引擎在步间
+检查信号，覆盖 pending、尚无可发送文本的 decode、`n>1` 部分准入失败与断连。
+同步 backend step 不能被中途打断。服务 shutdown 关闭提交队列并取消在途请求，
+`/readyz` 随引擎退出返回 503；这不是请求超时、抢占或 GPU 中断功能，
+HTTP 网络排空也没有强制 deadline。
+
+`EngineConfig.event_channel_capacity` 默认 64，可在 `--config` JSON 中设置，
+必须大于 0，旧 JSON 缺省该字段时使用默认值。引擎仅 `try_send`，满队列取消该候选，
+SSE 发出 `internal_error`（`slow consumer: event channel overflow`）和 `[DONE]`，
+不输出成功 usage。独立 oneshot 保证错误终态不被满队列挡住；成功终态先排空文本。
+非流式请求不订阅文本队列，长输出不会仅因超过此容量而被取消。
+
+多候选通过 `SelectAll` 直接拉取，没有第二层 fan-in 队列或转发任务；任一候选失败
+即聚合失败并取消其余候选。队列项数上界为 `n × capacity`，合并器另外最多持有
+每候选一项；这不是进程内存字节上界，完整输出、logprobs 和网络缓冲另计。
+默认 64 未经真实网络负载调优。实现取舍与测试定位见
+[取消与背压笔记](.agents/notes/implemented/feature/2026-10-04-bounded-events-and-cancellation.md)。
+
 ## 快速开始
 
 ### 环境要求
@@ -220,13 +241,13 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 | 指标名 | 类型 | 说明 |
 |--------|------|------|
 | `paged_requests_total` | counter | 累计 HTTP 请求数 |
-| `paged_errors_total` | counter | 累计错误响应数 |
-| `paged_inflight_requests` | gauge | 当前在途 HTTP 请求数 |
+| `paged_errors_total` | counter | handler 显式记录的错误；尚不完整覆盖 malformed JSON 与 SSE 终态 |
+| `paged_inflight_requests` | gauge | 当前 handler 或 SSE body 存活的 HTTP 请求数，不乘候选数 |
 | `paged_streaming_requests_total` | counter | 累计流式请求数 |
 | `paged_engine_active_sequences` | gauge | 引擎当前活跃序列数 |
 | `paged_engine_kv_utilization` | gauge | KV 块池利用率（0.0–1.0） |
-| `paged_engine_completed_requests` | counter | 累计成功完成请求数 |
-| `paged_engine_failed_requests` | counter | 累计失败请求数 |
+| `paged_engine_completed_requests` | counter | 引擎计算成功的候选数；不等于 HTTP 完整交付成功数 |
+| `paged_engine_failed_requests` | counter | 引擎失败候选数，当前包含取消；独立 cancelled 指标尚未实现 |
 | `paged_engine_tokens_generated_total` | counter | 累计生成 token 数 |
 
 ### 库用法

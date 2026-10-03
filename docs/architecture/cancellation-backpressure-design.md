@@ -4,6 +4,13 @@
 > （指标语义冻结）。评审包来源：`ai-infra-interview-prep/L3_L4_DESIGN_REVIEW_PACKAGES.md` §7。
 > 本文是设计冻结稿，未经 reviewer 批准前不得修改生产实现。
 
+> 实现对齐：2026-10-04 整改分支复用主动取消实现；有界 mailbox、带外终态、
+> 直接拉取式多候选合并与 CPU 回收测试见
+> [实现决策](../../.agents/notes/implemented/feature/2026-10-04-bounded-events-and-cancellation.md)。
+> 当前实现与下文目标稿有三处明确差异：成功终态必须先排空文本（不能忽略残余 chunk）；
+> fan-in 没有第二层队列/转发任务；typed `Cancelled` 与完整指标口径仍未实施。
+> 下文按约 1KB 估计的内存数不是当前实现的字节上界，logprobs 与完整输出需另计。
+
 ## 1. Decision summary
 
 - **Chosen design**：

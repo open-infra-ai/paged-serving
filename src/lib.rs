@@ -129,7 +129,9 @@ pub use execution_pipeline::{build_execution_batch, BatchExecutionPipeline};
 pub use gpu_executor::{create_default_gpu_executor, GPUExecutorTrait, MockGPUExecutor};
 pub use kv_cache::KVCacheManager;
 pub use scheduler::Scheduler;
-pub use server::{create_router, create_router_with_engine};
+pub use server::{
+    create_router, create_router_with_engine, create_router_with_engine_and_shutdown,
+};
 #[cfg(feature = "tiny-llm")]
 pub use tiny_llm_executor::TinyLlmExecutor;
 pub use tokenizer::{

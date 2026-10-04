@@ -259,11 +259,19 @@ impl RequestEvents {
         let completed = if let Some(done) = self.done.as_mut() {
             tokio::select! {
                 biased;
-                result = done => {
+                result = &mut *done => {
                     self.done = None;
                     result.ok()
                 }
-                chunk = self.chunks.recv() => return chunk,
+                chunk = self.chunks.recv() => {
+                    if chunk.is_some() {
+                        return chunk;
+                    }
+                    // 文本 EOF 不是终态；封口和发布 Done 可在不同 worker 上交错。
+                    let result = done.await;
+                    self.done = None;
+                    result.ok()
+                }
             }
         } else {
             self.completed.take()
@@ -2644,6 +2652,53 @@ mod tests {
         assert!(await_done(&mut events).await.success);
         assert!(next_event(&mut events).await.is_none());
         assert_eq!(probe.finished.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_text_channel_waits_for_terminal() {
+        for (success, cancellation) in [
+            (true, None),
+            (false, None),
+            (false, Some(CancellationReason::ServerShutdown)),
+        ] {
+            let (sender, mut events) = request_event_channel(1);
+            drop(sender.chunks);
+            let mut receiving = Box::pin(events.recv());
+            assert!(
+                futures_util::poll!(&mut receiving).is_pending(),
+                "text EOF must not replace an outstanding terminal"
+            );
+            let expected = CompletedRequest {
+                request_id: 1,
+                input_text: None,
+                output_text: String::new(),
+                output_tokens: Vec::new(),
+                success,
+                error: (!success).then(|| "terminal failure".into()),
+                cancellation,
+                finish_reason: success.then_some(FinishReason::Length),
+                logprobs: None,
+            };
+            sender.done.send(expected.clone()).unwrap();
+            match timeout(EVENT_TIMEOUT, receiving).await.unwrap() {
+                Some(RequestEvent::Done(actual)) => {
+                    assert_eq!(actual.success, expected.success);
+                    assert_eq!(actual.error, expected.error);
+                    assert_eq!(actual.cancellation, expected.cancellation);
+                    assert_eq!(actual.finish_reason, expected.finish_reason);
+                }
+                _ => panic!("the real terminal must be delivered"),
+            }
+            assert!(next_event(&mut events).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_text_and_terminal_channels_end_events() {
+        let (sender, mut events) = request_event_channel(1);
+        drop(sender);
+        assert!(next_event(&mut events).await.is_none());
+        assert!(next_event(&mut events).await.is_none());
     }
 
     #[tokio::test]

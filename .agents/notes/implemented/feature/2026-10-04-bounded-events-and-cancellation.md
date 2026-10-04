@@ -13,6 +13,7 @@ Status: implemented
 - 每候选文本 mailbox 容量由 `EngineConfig.event_channel_capacity` 指定，默认 64，零容量拒绝；旧 JSON 缺省该字段仍可读取。Rust 全字段 struct literal 需要补新字段，无 C ABI 变化。
 - 引擎仅 `try_send`；队列满即终止该候选，错误文本为 `slow consumer: event channel overflow`。独立 oneshot 保证终态不受满队列阻挡；失败与取消分类见 [类型化终态](../bug-fix/2026-10-04-typed-cancellation-and-metrics.md)。
 - 失败终态优先，丢弃剩余文本并输出 error 与 `[DONE]`；成功终态必须先排空已产生文本，再发送 usage 与 `[DONE]`。末步已经成功但文本投递溢出时，HTTP 仍失败，不能宣称完整成功。
+- 文本通道 EOF 只表示封口，不表示请求结束。接收端继续等待独立终态；只有终态通道也关闭且没有结果才报告提前结束。封口和发布终态跨 worker 交错时，成功 usage 与类型化取消都必须保留。
 - unary 不订阅文本，直接等待终态，避免没有消费需求的 mailbox 误触发 overflow。
 - 多候选直接使用已有 futures-util 的 `SelectAll` 拉取各候选事件，删除 fan-in 队列与转发任务。队列项上界为 `n × capacity`，再加至多每候选一个合并器持有的事件；这不是字节上界，logprobs、输出历史与网络缓冲另计。
 - 引擎检出 shutdown 真值后不可逆退出：关闭 submission 接收端，取消已有请求，排空未准入队列并拒绝它们。watch 的版本变化不等于真值，`send(false)` 不应误取消；调用方触发 shutdown 后必须保持真值，不能把它当可撤销开关。
@@ -38,6 +39,10 @@ inflight 先归零，才允许已在途步骤返回；再观察取消终态、�
 引擎 await 有界发送可无损等待客户端，但唯一 engine worker 会被单个慢请求阻塞，其他请求无法推进；因此选择局部取消慢消费者，而不承诺无损等待任意慢客户端。
 
 Done 与 Chunk 共用有界 mailbox 最简单、天然保序；但满队列时 Done 无法进入，只能依靠 sender-drop 报泛化错误。独立终态通道允许准确失败原因与成功排空。
+
+先发送 Done 再关闭文本 sender 能缩短当前发送端的竞态窗口，但文本 EOF 与终态是两个
+独立信号，接收端仍不能把 EOF 当终态。接收端等待 oneshot 保持双通道语义，不依赖
+两次发送操作恰好在同一个 worker 调度片段内完成，也不增加 sleep 或重试。
 
 Router oneshot 可直接控制 body 的持有/丢弃，适合确定性 mailbox 溢出回归；但它跳过
 hyper 与 socket 生命周期。真实 TCP 用例与这些测试并存，不从“客户端停止读取”猜
@@ -71,6 +76,11 @@ shutdown 用例读取真实 socket 的一个 error 与一个 DONE、无 usage，
 该批完整默认套件实际 280 个测试加 17 个 doc tests，真实 tokenizer 明确 1 个 ignored；
 Rust 1.88 locked all-target check、stable clippy/fmt、40 个离线结果审计测试与 notes
 门禁通过。生产实现、C ABI、锁文件、构建/CI 和历史 raw 没有修改。
+
+`closed_text_channel_waits_for_terminal` 用显式 poll 冻结“空文本队列已封口、终态尚未
+发布”的窗口；覆盖成功、失败和 shutdown 取消，收到真实终态恰好一次。该回归在
+未修复实现上失败，接收端等待独立终态后通过；两个通道均异常关闭的回归仍返回 EOF。
+这组确定性事件测试与真实 TCP 回归并存，不从重复运行次数推导竞态不存在。
 
 ## Consequences
 

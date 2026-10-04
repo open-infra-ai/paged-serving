@@ -1,0 +1,446 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.56s
+     Running unittests src/lib.rs (target/debug/deps/paged_serving-87817ab17653c4be)
+
+running 176 tests
+test config::property_tests::prop_config_validation ... ok
+test config::property_tests::prop_invalid_configs_rejected ... ok
+test config::tests::event_channel_capacity_is_validated_and_defaults_for_old_json ... ok
+test config::tests::test_blocks_for_tokens ... ok
+test config::tests::test_config_round_trip_preserves_serving_and_tokenizer_settings ... ok
+test config::tests::test_default_config_includes_serving_and_tokenizer_defaults ... ok
+test config::tests::test_default_config_is_valid ... ok
+test config::tests::test_huggingface_tokenizer_requires_path ... ok
+test config::tests::test_invalid_memory_threshold ... ok
+test config::tests::test_invalid_memory_threshold_nan_rejected ... ok
+test config::tests::test_invalid_zero_fields ... ok
+test config::tests::test_tokens_in_blocks ... ok
+test cpu_executor::layer_isolation_tests::test_layer_kv_isolation ... ok
+test cpu_executor::layer_isolation_tests::test_multilayer_incremental_vs_full_recompute ... ok
+test cpu_executor::tests::test_cpu_executor_decode_uses_paged_cache ... ok
+test cpu_executor::tests::test_cpu_executor_deterministic ... ok
+test cpu_executor::tests::test_cpu_executor_empty_batch ... ok
+test cpu_executor::tests::test_cpu_executor_multi_block_paged_access ... ok
+test cpu_executor::tests::test_cpu_executor_multi_sequence ... ok
+test cpu_executor::tests::test_cpu_executor_prefill ... ok
+test cpu_executor::tests::test_kv_cache_bounded_across_waves ... ok
+test cpu_executor::tests::test_sequences_finished_reclaims_kv_blocks ... ok
+test engine::tests::test_cancel_request_stops_generation_and_surfaces_typed_cancellation ... ok
+test engine::tests::test_completed_request_preserves_input_text ... ok
+test engine::tests::test_completed_request_reports_finish_reason ... ok
+test engine::tests::test_decoder_push_failure_fails_request_honestly ... ok
+test engine::tests::test_decoder_state_cleaned_up_on_cancel_and_failure ... ok
+test engine::tests::test_engine_creation ... ok
+test engine::tests::test_engine_creation_fails_when_huggingface_tokenizer_file_is_missing ... ok
+test engine::tests::test_executor_failure_marks_request_failed_and_clears_pending_work ... ok
+test engine::tests::test_executor_failure_updates_failure_metrics ... ok
+test engine::tests::test_gpu_timeout_exhausts_retries_then_fails_request ... ok
+test engine::tests::test_gpu_timeout_retries_once_then_succeeds ... ok
+test engine::tests::test_multiple_requests ... ok
+test engine::tests::test_non_retry_safe_timeout_fails_without_replay ... ok
+test engine::tests::test_run_oversized_prompt_fails_not_stranded ... ok
+test engine::tests::test_run_to_completion ... ok
+test engine::tests::test_sequences_finished_called_on_cancel ... ok
+test engine::tests::test_sequences_finished_called_on_execution_failure ... ok
+test engine::tests::test_sequences_finished_called_on_normal_completion ... ok
+test engine::tests::test_step ... ok
+test engine::tests::test_stop_sequence_truncates_output_and_reports_stop ... ok
+test engine::tests::test_stop_sequence_unicode_byte_offset_end_to_end ... ok
+test engine::tests::test_stop_sequence_unmatched_reports_length ... ok
+test engine::tests::test_streaming_chunks_concat_equals_final_output ... ok
+test engine::tests::test_streaming_equivalence_with_huggingface_decoder ... ok
+test engine::tests::test_submit_empty_request ... ok
+test engine::tests::test_submit_invalid_params ... ok
+test engine::tests::test_submit_request ... ok
+test engine::tests::test_submit_request_allows_total_length_at_limit ... ok
+test engine::tests::test_submit_request_rejects_non_greedy_params_on_greedy_only_backend ... ok
+test engine::tests::test_submit_request_rejects_prompt_too_long_before_generation_check ... ok
+test engine::tests::test_submit_request_rejects_total_length_over_limit ... ok
+test engine::tests::test_submit_request_uses_configured_huggingface_tokenizer ... ok
+test engine::tests::test_terminal_metrics_use_state_not_error_text ... ok
+test engine::tests::test_tokens_before_char_uses_byte_offset_for_unicode ... ok
+test execution_pipeline::tests::test_decode_batch_fails_fast_on_empty_sequence ... ok
+test execution_pipeline::tests::test_decode_batch_falls_back_to_last_prompt_token ... ok
+test execution_pipeline::tests::test_decode_batch_uses_last_generated_token_and_position ... ok
+test execution_pipeline::tests::test_validate_batch_shape_accepts_valid_batch ... ok
+test execution_pipeline::tests::test_validate_batch_shape_rejects_empty_block_table ... ok
+test execution_pipeline::tests::test_validate_batch_shape_rejects_seq_len_mismatch ... ok
+test execution_pipeline::tests::test_validate_batch_shape_rejects_token_position_mismatch ... ok
+test execution_pipeline::tests::test_validate_batch_shape_rejects_token_total_mismatch ... ok
+test execution_pipeline::tests::test_validate_batch_shape_rejects_zero_len_sequence ... ok
+test execution_pipeline::tests::test_validate_execution_output_accepts_valid_output ... ok
+test execution_pipeline::tests::test_validate_execution_output_rejects_duplicate_seq_id ... ok
+test execution_pipeline::tests::test_validate_execution_output_rejects_empty_output ... ok
+test execution_pipeline::tests::test_validate_execution_output_rejects_missing_token ... ok
+test execution_pipeline::tests::test_validate_execution_output_rejects_wrong_logprobs_length ... ok
+test execution_pipeline::tests::test_validate_execution_output_rejects_wrong_seq_id_set ... ok
+test gpu_executor::property_tests::prop_batch_size_validation ... ok
+test gpu_executor::property_tests::prop_output_per_sequence ... ok
+test gpu_executor::property_tests::prop_variable_sequence_length_handling ... ok
+test gpu_executor::tests::test_mock_executor_execute_batch ... ok
+test gpu_executor::tests::test_mock_executor_execute_empty ... ok
+test gpu_executor::tests::test_mock_executor_rejects_empty_vocabulary ... ok
+test kv_cache::property_tests::prop_block_allocation_on_growth ... ok
+test kv_cache::property_tests::prop_block_allocation_on_sequence_start ... ok
+test kv_cache::property_tests::prop_block_count_invariant ... ok
+test kv_cache::property_tests::prop_memory_statistics_invariant ... ok
+test kv_cache::tests::test_block_pool_allocation ... ok
+test kv_cache::tests::test_block_pool_exhaustion ... ok
+test kv_cache::tests::test_blocks_for_tokens ... ok
+test kv_cache::tests::test_kv_cache_manager_allocate_block ... ok
+test kv_cache::tests::test_kv_cache_manager_allocate_sequence ... ok
+test kv_cache::tests::test_kv_cache_manager_free_sequence ... ok
+test scheduler::property_tests::prop_batch_size_constraints ... ok
+test scheduler::property_tests::prop_completion_conditions ... ok
+test scheduler::property_tests::prop_decode_priority_over_prefill ... ok
+test scheduler::property_tests::prop_memory_pressure_response ... ok
+test scheduler::property_tests::prop_prefill_to_decode_transition ... ok
+test scheduler::property_tests::prop_request_id_uniqueness ... ok
+test scheduler::property_tests::prop_resources_reclaimed_after_cancel_and_failure ... ok
+test scheduler::property_tests::prop_scheduler_queue_state_consistency ... ok
+test scheduler::tests::test_add_request ... ok
+test scheduler::tests::test_add_request_counts_pending_toward_max_num_seqs ... ok
+test scheduler::tests::test_add_request_returns_real_seq_id ... ok
+test scheduler::tests::test_add_request_sequence_ids_are_monotonic ... ok
+test scheduler::tests::test_cancel_by_request_id_covers_all_stages_and_frees_kv ... ok
+test scheduler::tests::test_completion ... ok
+test scheduler::tests::test_decode_priority ... ok
+test scheduler::tests::test_decode_priority_with_small_batch_keeps_pending_request_queued ... ok
+test scheduler::tests::test_decode_seq_ids_orders_by_priority_desc ... ok
+test scheduler::tests::test_fail_pending_requests_drains_and_reports ... ok
+test scheduler::tests::test_grow_decode_sequence_fails_for_missing_sequence ... ok
+test scheduler::tests::test_has_prefill_budget_false_when_only_one_block_left_and_candidate_needs_decode_reserve ... ok
+test scheduler::tests::test_next_step_growth_reserve_counts_boundary_sequences ... ok
+test scheduler::tests::test_oversized_prompt_fails_instead_of_wedging_pending ... ok
+test scheduler::tests::test_pending_queue_counts_toward_max_sequences ... ok
+test scheduler::tests::test_pending_queue_skips_large_prefill_for_smaller_one ... ok
+test scheduler::tests::test_prefill_to_decode_transition ... ok
+test scheduler::tests::test_priority_field_defaults_to_zero_and_validates ... ok
+test scheduler::tests::test_priority_higher_prefill_starts_first ... ok
+test scheduler::tests::test_priority_same_level_keeps_fcfs ... ok
+test scheduler::tests::test_schedule_prefill ... ok
+test scheduler::tests::test_schedule_prefill_uses_returned_seq_id ... ok
+test scheduler::tests::test_update_sequences_fails_request_when_output_missing_token ... ok
+test server::tests::admission_precheck_skips_cancelled_submission ... ok
+test server::tests::backend_failure_preempts_buffered_text_and_releases_once ... ok
+test server::tests::cancel_decode_request_via_guard_drop ... ok
+test server::tests::cancel_during_silent_decode_does_not_require_chunk ... ok
+test server::tests::cancel_flagged_dispatches_terminal_for_pending ... ok
+test server::tests::cancel_pending_request_via_guard_drop ... ok
+test server::tests::cancelling_one_request_does_not_affect_others ... ok
+test server::tests::guard_drop_after_completion_is_harmless ... ok
+test server::tests::last_step_overflow_is_not_http_success ... ok
+test server::tests::multi_failure_cancels_sibling_before_done_is_read ... ok
+test server::tests::overflow_has_priority_terminal_and_releases_once ... ok
+test server::tests::partial_admission_failure_releases_admitted_candidate ... ok
+test server::tests::premature_sse_closure_counts_one_http_error_for_single_and_multi ... ok
+test server::tests::shutdown_broadcast_cancels_all_inflight ... ok
+test server::tests::shutdown_rejects_queued_submissions_without_execution ... ok
+test server::tests::shutdown_wakes_idle_loop_and_false_is_not_shutdown ... ok
+test server::tests::slow_consumer_does_not_block_concurrent_unary ... ok
+test server::tests::success_drains_all_text_before_terminal ... ok
+test server::tests::test_build_chat_prompt_huggingface_uses_qwen2 ... ok
+test server::tests::test_build_chat_prompt_simple_keeps_role_concat ... ok
+test server::tests::test_chat_request_parses_priority_field ... ok
+test server::tests::test_completion_request_parses_priority_field ... ok
+test server::tests::test_generation_params_passes_priority ... ok
+test server::tests::test_qwen2_chat_prompt_with_system ... ok
+test server::tests::test_qwen2_chat_prompt_without_system ... ok
+test tiny_llm_executor::tests::test_alloc_tokens_for_capacity_formula ... ok
+test tiny_llm_executor::tests::test_decode_budget_overrun_condition ... ok
+test tiny_llm_executor::tests::test_env_i32_or_fallback ... ok
+test tiny_llm_ffi::tests::tiny_llm_config_fields_map_to_c_ints ... ok
+test tiny_llm_ffi::tests::tiny_llm_config_layout_is_stable ... ok
+test tiny_llm_ffi::tests::token_id_is_ffi_compatible ... ok
+test tokenizer::property_tests::prop_ascii_round_trip ... ok
+test tokenizer::property_tests::prop_encoding_consistency ... ok
+test tokenizer::property_tests::prop_token_count ... ok
+test tokenizer::property_tests::prop_tokenizer_round_trip ... ok
+test tokenizer::tests::test_build_tokenizer_uses_huggingface_when_configured ... ok
+test tokenizer::tests::test_custom_special_tokens ... ok
+test tokenizer::tests::test_empty_string ... ok
+test tokenizer::tests::test_huggingface_decoder_finish_on_empty_is_none ... ok
+test tokenizer::tests::test_huggingface_decoder_streams_before_finish ... ok
+test tokenizer::tests::test_huggingface_tokenizer_detects_real_special_tokens ... ok
+test tokenizer::tests::test_huggingface_tokenizer_loads_and_round_trips ... ok
+test tokenizer::tests::test_round_trip_tokenizer ... ok
+test tokenizer::tests::test_simple_decoder_skips_special_tokens_like_one_shot ... ok
+test tokenizer::tests::test_simple_decoder_streaming_equivalence ... ok
+test tokenizer::tests::test_simple_decoder_utf8_equivalence ... ok
+test tokenizer::tests::test_simple_decoder_without_special_tokens_round_trip ... ok
+test tokenizer::tests::test_simple_tokenizer_decode ... ok
+test tokenizer::tests::test_simple_tokenizer_encode ... ok
+test tokenizer::tests::test_special_characters ... ok
+test tokenizer::tests::test_vocab_size ... ok
+test types::memory::tests::test_memory_stats_utilization ... ok
+test types::request::property_tests::prop_parameter_boundaries ... ok
+test types::request::property_tests::prop_parameter_validation ... ok
+test types::request::tests::test_finish_reason_as_str ... ok
+test types::request::tests::test_generation_params_validation ... ok
+test types::request::tests::test_nan_parameters_rejected ... ok
+test types::request::tests::test_request_is_complete ... ok
+
+test result: ok. 176 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+     Running unittests src/bin/loadgen.rs (target/debug/deps/loadgen-2cf7a9c8dd46a04a)
+
+running 18 tests
+test tests::run_request_accepts_crlf_sse_end_to_end ... ok
+test tests::run_request_classifies_connection_refused ... ok
+test tests::run_request_classifies_error_frame_as_stream_error ... ok
+test tests::run_request_classifies_http_error_statuses ... ok
+test tests::run_request_classifies_invalid_json_as_protocol_error ... ok
+test tests::run_request_classifies_invalid_utf8_as_protocol_error ... ok
+test tests::run_request_classifies_missing_done_as_failure ... ok
+test tests::run_request_classifies_timeout ... ok
+test tests::run_request_handles_utf8_split_across_tcp_writes ... ok
+test tests::run_request_success_with_usage_over_real_http ... ok
+test tests::run_request_without_usage_leaves_token_count_unknown ... ok
+test tests::seeded_poisson_intervals_are_reproducible ... ok
+test tests::sse_parser_joins_multiple_data_lines ... ok
+test tests::sse_parser_waits_for_complete_utf8_event_and_accepts_crlf ... ok
+test tests::summary_aggregates_error_classes ... ok
+test tests::summary_defaults_to_request_record_directory ... ok
+test tests::summary_excludes_warmup_records ... ok
+test tests::token_throughput_requires_complete_successful_request_coverage ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+
+     Running unittests src/main.rs (target/debug/deps/paged_serving-7183f51b5de7c57b)
+
+running 1 test
+test tests::backend_arguments_fail_on_mismatched_model_path ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/concurrency_stress.rs (target/debug/deps/concurrency_stress-774b8d4b049aa387)
+
+running 4 tests
+test test_concurrent_burst_tail_latency_and_success ... ok
+test test_failure_isolation_and_reclamation ... ok
+test test_memory_pressure_rejects_or_queues_gracefully ... ok
+test test_resource_conservation_under_high_concurrency ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/integration_tests.rs (target/debug/deps/integration_tests-5f31d461cc435d4a)
+
+running 15 tests
+test test_configuration_validation ... ok
+test test_continuous_batching ... ok
+test test_end_to_end_request_flow ... ok
+test test_execution_failure_surfaces_as_completed_error ... ok
+test test_invalid_request_handling ... ok
+test test_large_batch_processing ... ok
+test test_malformed_backend_output_fails_request_and_terminates ... ok
+test test_memory_pressure_handling ... ok
+test test_memory_pressure_leaves_decode_growth_reserve ... ok
+test test_memory_utilization_tracking ... ok
+test test_metrics_collection ... ok
+test test_multiple_requests_completion ... ok
+test test_request_completion_on_max_tokens ... ok
+test test_sequential_request_processing ... ok
+test test_small_pending_request_not_blocked_by_large_one ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+
+     Running tests/loadgen_cli.rs (target/debug/deps/loadgen_cli-b5762fe1dd1c200d)
+
+running 4 tests
+test closed_cli_excludes_real_warmup_and_writes_exact_artifacts ... ok
+test complete_usage_cli_reports_wall_time_throughput_and_custom_summary ... ok
+test invalid_cli_arguments_fail_without_result_files ... ok
+test poisson_cli_replays_planned_load_independently_of_warmup ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s
+
+     Running tests/server_integration.rs (target/debug/deps/server_integration-ad4a63f0e170006f)
+
+running 48 tests
+test test_backend_errors_count_once_for_unary_and_unpolled_sse ... ok
+test test_chat_completions_honors_stop_sequences ... ok
+test test_chat_completions_rejects_empty_messages ... ok
+test test_chat_completions_rejects_invalid_role ... ok
+test test_chat_completions_rejects_unsupported_params ... ok
+test test_chat_completions_returns_assistant_message ... ok
+test test_chat_completions_returns_logprobs ... ok
+test test_chat_completions_returns_n_candidates ... ok
+test test_client_disconnect_cancels_generation ... ok
+test test_completed_multi_sse_drains_text_before_usage ... ok
+test test_completions_accepts_unsupported_params_at_defaults ... ok
+test test_completions_honors_stop_sequences ... ok
+test test_completions_maps_execution_failure_to_500 ... ok
+test test_completions_omits_logprobs_by_default ... ok
+test test_completions_rejects_empty_prompt ... ok
+test test_completions_rejects_invalid_n ... ok
+test test_completions_rejects_invalid_sampling_params ... ok
+test test_completions_rejects_logprobs_above_limit ... ok
+test test_completions_rejects_malformed_json_with_envelope ... ok
+test test_completions_rejects_non_greedy_sampling_params ... ok
+test test_completions_rejects_too_many_stop_sequences ... ok
+test test_completions_rejects_unknown_model ... ok
+test test_completions_rejects_unsupported_params ... ok
+test test_completions_reports_length_finish_reason_when_truncated ... ok
+test test_completions_reports_stop_finish_reason_on_eos ... ok
+test test_completions_returns_429_when_overloaded ... ok
+test test_completions_returns_logprobs ... ok
+test test_completions_returns_n_candidates ... ok
+test test_completions_returns_openai_shape ... ok
+test test_completions_stream_returns_done_event ... ok
+test test_concurrent_requests_both_complete ... ok
+test test_health_and_ready_endpoints ... ok
+test test_json_and_validation_rejections_are_counted_once ... ok
+test test_metrics_endpoint_exposes_prometheus_counters ... ok
+test test_multi_candidate_slow_sse_is_bounded_and_fails_as_a_whole ... ok
+test test_oversized_prompt_gets_error_and_server_stays_responsive ... ok
+test test_shutdown_terminates_silent_sse_and_readiness ... ok
+test test_shutdown_unary_is_typed_cancellation_not_generation_error ... ok
+test test_slow_sse_has_error_terminal_even_with_full_mailbox ... ok
+test test_streaming_carries_logprobs ... ok
+test test_streaming_chunks_concat_equals_non_streaming_text ... ok
+test test_streaming_honors_stop_sequences ... ok
+test test_streaming_merges_n_candidates ... ok
+test test_streaming_n2_partial_admission_cancels_admitted_candidate ... ok
+test test_streaming_reports_stop_finish_reason_on_eos ... ok
+test test_unary_future_abort_cancels_request ... ok
+test test_unknown_route_returns_json_envelope ... ok
+test test_unpolled_multi_body_drop_cancels_silent_candidates ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.46s
+
+     Running tests/tiny_llm_backend.rs (target/debug/deps/tiny_llm_backend-890c7daaa763965f)
+
+running 4 tests
+test tiny_llm_backend_cancelled_batches_reuse_same_backend ... [2026-10-04 17:11:54.917] [info] [474067] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:11:54.917] [info] [474067] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:11:54.961] [info] [474067] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:11:54.961] [info] [474067] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:11:54.961] [info] [474067] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:11:54.961] [info] [474067] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:11:54.961] [info] [474067] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:11:54.995] [info] [474067] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:11:54.995] [info] [474067] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:11:54.995] [info] [474067] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+执行 1 步后取消四请求，同一后端四请求复用成功: EngineMetrics { total_requests: 8, completed_requests: 4, failed_requests: 0, cancelled_requests: 4, total_tokens_generated: 17, memory_utilization: 0.0, active_sequences: 0 }
+执行 2 步后取消四请求，同一后端四请求复用成功: EngineMetrics { total_requests: 16, completed_requests: 8, failed_requests: 0, cancelled_requests: 8, total_tokens_generated: 38, memory_utilization: 0.0, active_sequences: 0 }
+ok
+test tiny_llm_backend_decode_overrun_reports_clear_error ... [2026-10-04 17:12:15.182] [info] [474074] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:12:15.182] [info] [474074] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:12:15.214] [info] [474074] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:12:15.214] [info] [474074] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:12:15.214] [info] [474074] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:12:15.214] [info] [474074] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:12:15.214] [info] [474074] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:12:15.244] [info] [474074] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:12:15.244] [info] [474074] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:12:15.244] [info] [474074] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+越界终态后，同一后端的四请求复用成功
+ok
+test tiny_llm_backend_end_to_end ... [2026-10-04 17:12:34.424] [info] [474078] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:12:34.424] [info] [474078] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:12:34.453] [info] [474078] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:12:34.453] [info] [474078] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:12:34.453] [info] [474078] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:12:34.453] [info] [474078] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:12:34.453] [info] [474078] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:12:34.480] [info] [474078] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:12:34.480] [info] [474078] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:12:34.480] [info] [474078] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+ok
+test tiny_llm_backend_withheld_release_control_distinguishes_strategies ... [2026-10-04 17:12:52.913] [info] [474089] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:12:52.914] [info] [474089] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:12:52.942] [info] [474089] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:12:52.942] [info] [474089] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:12:52.942] [info] [474089] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:12:52.942] [info] [474089] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:12:52.943] [info] [474089] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:12:52.971] [info] [474089] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:12:52.971] [info] [474089] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:12:52.971] [info] [474089] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+拦截释放通知对照: contiguous=true, EngineMetrics { total_requests: 8, completed_requests: 0, failed_requests: 4, cancelled_requests: 4, total_tokens_generated: 8, memory_utilization: 0.0, active_sequences: 0 }
+探针终态: [CompletedRequest { request_id: 5, input_text: Some("prompt 0"), output_text: "", output_tokens: [], success: false, error: Some("计算后端错误: tinyllm_allocate_sequence(5) failed"), cancellation: None, finish_reason: None, logprobs: None }, CompletedRequest { request_id: 6, input_text: Some("prompt 1"), output_text: "", output_tokens: [], success: false, error: Some("计算后端错误: tinyllm_allocate_sequence(5) failed"), cancellation: None, finish_reason: None, logprobs: None }, CompletedRequest { request_id: 7, input_text: Some("prompt 2"), output_text: "", output_tokens: [], success: false, error: Some("计算后端错误: tinyllm_allocate_sequence(5) failed"), cancellation: None, finish_reason: None, logprobs: None }, CompletedRequest { request_id: 8, input_text: Some("prompt 3"), output_text: "", output_tokens: [], success: false, error: Some("计算后端错误: tinyllm_allocate_sequence(5) failed"), cancellation: None, finish_reason: None, logprobs: None }]
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.16s
+
+     Running tests/tiny_llm_text_e2e.rs (target/debug/deps/tiny_llm_text_e2e-6f6be8d276544022)
+
+running 3 tests
+test qwen2_chat_prompt_matches_llama_cpp ... [2026-10-04 17:13:08.317] [info] [474142] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:13:08.317] [info] [474142] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:13:08.360] [info] [474142] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:13:08.360] [info] [474142] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:13:08.360] [info] [474142] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:13:08.360] [info] [474142] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:13:08.360] [info] [474142] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:13:08.400] [info] [474142] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:13:08.400] [info] [474142] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:13:08.400] [info] [474142] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+prompt_tokens=14
+output_tokens(24) = [9707, 0, 358, 2776, 1101, 264, 6366, 2025, 11, 773, 358, 1513, 944, 614, 15650, 13, 2585, 646, 358, 7789, 498, 3351, 30, 151645]
+output_text = "Hello! I'm just a computer program, so I don't have feelings. How can I assist you today?"
+finish_reason = Some(Stop)
+对比: 期望 24 个 token
+ok
+test qwen2_text_generation_end_to_end ... [2026-10-04 17:13:26.297] [info] [474147] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:13:26.297] [info] [474147] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:13:26.331] [info] [474147] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:13:26.331] [info] [474147] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:13:26.331] [info] [474147] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:13:26.331] [info] [474147] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:13:26.331] [info] [474147] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:13:26.366] [info] [474147] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:13:26.366] [info] [474147] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:13:26.366] [info] [474147] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+prompt_tokens=6 (Hello, how are you?)
+output_tokens(32) = [358, 2776, 264, 48948, 304, 13027, 323, 358, 2776, 4460, 311, 1855, 264, 2025, 429, 646, 1349, 264, 1467, 1034, 323, 1760, 279, 1372, 315, 4244, 304, 432, 13, 2980, 498, 1492]
+output_text = " I'm a beginner in Python and I'm trying to create a program that can read a text file and count the number of words in it. Can you help"
+finish_reason = Some(Length)
+ok
+test qwen2_three_concurrent_paged_requests_match_llama_cpp ... [2026-10-04 17:13:40.910] [info] [474157] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:13:40.910] [info] [474157] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:13:40.945] [info] [474157] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:13:40.945] [info] [474157] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:13:40.945] [info] [474157] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:13:40.945] [info] [474157] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:13:40.945] [info] [474157] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:13:40.979] [info] [474157] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:13:40.979] [info] [474157] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:13:40.979] [info] [474157] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+request1: id=1 tokens=[9707, 0, 358, 2776, 1101, 264, 6366, 2025, 11, 773, 358, 1513, 944, 614, 15650, 13, 2585, 646, 358, 7789, 498, 3351, 30, 151645] text="Hello! I'm just a computer program, so I don't have feelings. How can I assist you today?"
+request2: id=2 tokens=[17, 10, 17, 374, 220, 19, 13, 151645] text="2+2 is 4."
+request3: id=3 tokens=[271, 40, 1079, 4460, 311, 1855, 264, 4285, 2025, 429, 686, 1896, 264, 914, 323, 264, 1372, 438, 1946, 11, 323, 1221, 2550, 279, 914, 448, 279, 1372, 315, 5766, 6963, 13] text="\n\nI am trying to create a simple program that will take a string and a number as input, and then output the string with the number of characters removed."
+metrics: active_sequences=0 memory_utilization=0.000
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 43.99s
+
+     Running tests/tokenizer_real_diff.rs (target/debug/deps/tokenizer_real_diff-f517d9569b156466)
+
+running 1 test
+test qwen2_tokenizer_matches_tiny_llm_fixture ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+   Doc-tests paged_serving
+
+running 17 tests
+test src/config.rs - config (line 7) ... ok
+test src/config.rs - config::EngineConfig (line 93) ... ok
+test src/config.rs - config::EngineConfig::blocks_for_tokens (line 262) ... ok
+test src/config.rs - config::EngineConfig::from_file (line 226) - compile ... ok
+test src/config.rs - config::EngineConfig::to_file (line 246) - compile ... ok
+test src/config.rs - config::EngineConfig::tokens_in_blocks (line 274) ... ok
+test src/config.rs - config::EngineConfig::validate (line 159) ... ok
+test src/engine.rs - engine (line 28) ... ok
+test src/engine.rs - engine::InferenceEngine (line 112) ... ok
+test src/engine.rs - engine::InferenceEngine::get_metrics (line 699) ... ok
+test src/engine.rs - engine::InferenceEngine::new (line 149) ... ok
+test src/engine.rs - engine::InferenceEngine::run (line 547) ... ok
+test src/engine.rs - engine::InferenceEngine::submit_request (line 237) ... ok
+test src/error.rs - error (line 20) ... ok
+test src/error.rs - error::EngineError (line 106) ... ok
+test src/lib.rs - (line 34) ... ok
+test src/tokenizer.rs - tokenizer (line 19) ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.11s
+

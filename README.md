@@ -446,10 +446,17 @@ export PAGED_SERVING_TINY_LLM_STRATEGY=1
 export PAGED_SERVING_TINY_LLM_MAX_SEQS=4
 export PAGED_SERVING_TINY_LLM_DECODE_RESERVE=512
 
-# 串行运行 2 个 GPU 接入/回收、3 个 GPU 文本与 1 个 tokenizer 测试
+# 串行运行 4 个 GPU 接入/生命周期用例（含故障对照）、3 个 GPU 文本与 1 个 tokenizer 测试
 cargo test --locked --features tiny-llm \
   --test tiny_llm_backend --test tiny_llm_text_e2e --test tokenizer_real_diff \
   -- --include-ignored --test-threads=1
+
+# 分别以分页 KV / 连续 KV 验证终态后的同实例复用；每种策略使用独立进程
+for strategy in 1 2; do
+  PAGED_SERVING_TINY_LLM_STRATEGY="$strategy" \
+    cargo test --locked --features tiny-llm --test tiny_llm_backend \
+    -- --test-threads=1 --nocapture
+done
 ```
 
 GPU 命令要求已有 CMake 构建目录、CUDA 工具链、兼容 GPU、模型与匹配 tokenizer；
@@ -460,6 +467,13 @@ GPU 命令要求已有 CMake 构建目录、CUDA 工具链、兼容 GPU、模型
 提交测试证据时记录双仓源码状态、输入和静态库 SHA-256；默认 CPU 绿色不代表 GPU
 验证，单次 GPU 功能验证也不代表持续门禁、HTTP 取消回收或性能结论。执行语义见
 [真实测试门禁笔记](.agents/notes/implemented/testing/2026-10-04-real-test-execution-gates.md)。
+
+生命周期用例覆盖越界失败后四请求复用，以及 prefill/decode 后取消四请求、再成功
+运行四请求；逻辑 KV 必须精确归零。测试还故意拦截后端释放通知：连续 KV 的
+下一批会分配失败，分页 KV 的下一批仍能运行。因此“利用率归零且能再服务”
+不能证明分页序列登记没有泄漏。此负对照是测试预期，不是正常后端报错；限制见
+[终态复用笔记](.agents/notes/implemented/testing/2026-10-04-real-backend-terminal-reuse.md)。
+这些取消发生在同步 GPU step 返回后，不证明 kernel 抢占、HTTP 断连或显存字节释放。
 
 ## 贡献指南
 

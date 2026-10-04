@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- 2026-10-04 终态复用批次：真实后端越界后继续运行满四请求；prefill/decode 后
+  各取消四请求并复用同一实例，检查独立取消分类、一次终态与逻辑 KV 精确归零。
+  故意拦截释放通知的真实计算对照区分连续 KV 槽位耗尽与分页 KV 的探针盲区；
+  策略 1/2 用独立进程验证，不改生产 ABI，也不宣称 HTTP 断连或显存字节回收。
 - 2026-10-04 结果语义批次：Serving JSONL/summary/metadata 联合重算、标准库
   正/负夹具门禁与独立 CI；`--json` 输出机器可读诊断，10% 波动标记 `non_converged`
   而不隐藏负结果。正式校验要求至少三次重复与 30 秒预热；历史可选字段不回填。

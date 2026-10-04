@@ -1,0 +1,56 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running tests/tiny_llm_backend.rs (target/debug/deps/tiny_llm_backend-890c7daaa763965f)
+
+running 4 tests
+test tiny_llm_backend_cancelled_batches_reuse_same_backend ... [2026-10-04 17:09:18.463] [info] [472750] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:09:18.463] [info] [472750] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:09:18.507] [info] [472750] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:09:18.507] [info] [472750] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:09:18.507] [info] [472750] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:09:18.507] [info] [472750] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:09:18.507] [info] [472750] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:09:18.539] [info] [472750] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:09:18.539] [info] [472750] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:09:18.539] [info] [472750] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+执行 1 步后取消四请求，同一后端四请求复用成功: EngineMetrics { total_requests: 8, completed_requests: 4, failed_requests: 0, cancelled_requests: 4, total_tokens_generated: 17, memory_utilization: 0.0, active_sequences: 0 }
+执行 2 步后取消四请求，同一后端四请求复用成功: EngineMetrics { total_requests: 16, completed_requests: 8, failed_requests: 0, cancelled_requests: 8, total_tokens_generated: 38, memory_utilization: 0.0, active_sequences: 0 }
+ok
+test tiny_llm_backend_decode_overrun_reports_clear_error ... [2026-10-04 17:09:41.582] [info] [473428] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:09:41.583] [info] [473428] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:09:41.617] [info] [473428] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:09:41.617] [info] [473428] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:09:41.617] [info] [473428] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:09:41.617] [info] [473428] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:09:41.617] [info] [473428] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:09:41.650] [info] [473428] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:09:41.650] [info] [473428] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:09:41.650] [info] [473428] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+越界终态后，同一后端的四请求复用成功
+ok
+test tiny_llm_backend_end_to_end ... [2026-10-04 17:10:01.229] [info] [473445] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:10:01.229] [info] [473445] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:10:01.264] [info] [473445] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:10:01.264] [info] [473445] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:10:01.264] [info] [473445] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:10:01.264] [info] [473445] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:10:01.264] [info] [473445] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:10:01.298] [info] [473445] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:10:01.298] [info] [473445] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:10:01.298] [info] [473445] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+ok
+test tiny_llm_backend_withheld_release_control_distinguishes_strategies ... [2026-10-04 17:10:19.534] [info] [473448] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:10:19.534] [info] [473448] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:10:19.562] [info] [473448] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:10:19.562] [info] [473448] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:10:19.562] [info] [473448] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:10:19.562] [info] [473448] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 17:10:19.562] [info] [473448] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 17:10:19.589] [info] [473448] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 17:10:19.589] [info] [473448] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 17:10:19.589] [info] [473448] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+拦截释放通知对照: contiguous=false, EngineMetrics { total_requests: 8, completed_requests: 4, failed_requests: 0, cancelled_requests: 4, total_tokens_generated: 21, memory_utilization: 0.0, active_sequences: 0 }
+探针终态: [CompletedRequest { request_id: 5, input_text: Some("prompt 0"), output_text: " 0", output_tokens: [4, 20, 2], success: true, error: None, cancellation: None, finish_reason: Some(Stop), logprobs: None }, CompletedRequest { request_id: 7, input_text: Some("prompt 2"), output_text: " 2", output_tokens: [4, 22, 2], success: true, error: None, cancellation: None, finish_reason: Some(Stop), logprobs: None }, CompletedRequest { request_id: 8, input_text: Some("prompt 3"), output_text: " 3", output_tokens: [4, 23, 2], success: true, error: None, cancellation: None, finish_reason: Some(Stop), logprobs: None }, CompletedRequest { request_id: 6, input_text: Some("prompt 1"), output_text: " 2 3", output_tokens: [4, 22, 4, 23], success: true, error: None, cancellation: None, finish_reason: Some(Length), logprobs: None }]
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 69.09s
+

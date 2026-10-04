@@ -157,7 +157,7 @@ Paged-Serving 是一个基于 Rust 构建的 LLM Serving 控制面，以模块�
 HTTP 网络排空也没有强制 deadline。
 
 `EngineConfig.event_channel_capacity` 默认 64，可在 `--config` JSON 中设置，
-必须大于 0，旧 JSON 缺省该字段时使用默认值。引擎仅 `try_send`，满队列取消该候选，
+必须大于 0，旧 JSON 缺省该字段时使用默认值。引擎仅 `try_send`，满队列失败该候选，
 SSE 发出 `internal_error`（`slow consumer: event channel overflow`）和 `[DONE]`，
 不输出成功 usage。独立 oneshot 保证错误终态不被满队列挡住；成功终态先排空文本。
 非流式请求不订阅文本队列，长输出不会仅因超过此容量而被取消。
@@ -240,15 +240,28 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 | 指标名 | 类型 | 说明 |
 |--------|------|------|
-| `paged_requests_total` | counter | 累计 HTTP 请求数 |
-| `paged_errors_total` | counter | handler 显式记录的错误；尚不完整覆盖 malformed JSON 与 SSE 终态 |
+| `paged_requests_total` | counter | completion/chat HTTP 请求数，含被拒绝请求；健康检查、metrics 与未知路由不计入 |
+| `paged_errors_total` | counter | 请求拒绝、计算或应用层交付失败的 HTTP 请求数，每请求最多一次；不含主动取消 |
 | `paged_inflight_requests` | gauge | 当前 handler 或 SSE body 存活的 HTTP 请求数，不乘候选数 |
-| `paged_streaming_requests_total` | counter | 累计流式请求数 |
-| `paged_engine_active_sequences` | gauge | 引擎当前活跃序列数 |
+| `paged_streaming_requests_total` | counter | 成功构建 SSE 的 HTTP 请求数；不乘 `n`，准入失败不计入 |
+| `paged_engine_active_sequences` | gauge | prefill/decode 候选数，不含 pending |
 | `paged_engine_kv_utilization` | gauge | KV 块池利用率（0.0–1.0） |
 | `paged_engine_completed_requests` | counter | 引擎计算成功的候选数；不等于 HTTP 完整交付成功数 |
-| `paged_engine_failed_requests` | counter | 引擎失败候选数，当前包含取消；独立 cancelled 指标尚未实现 |
-| `paged_engine_tokens_generated_total` | counter | 累计生成 token 数 |
+| `paged_engine_failed_requests` | counter | 引擎失败候选数，含完成前的慢消费者溢出，不含主动取消 |
+| `paged_engine_cancelled_requests` | counter | 完成前被主动取消的候选数（客户端退出、shutdown） |
+| `paged_engine_tokens_generated_total` | counter | 已排出终态候选生成的 token 总数，包含失败与取消前的部分输出 |
+
+每项指标都有 HELP/TYPE。候选终态记录错误，即使 SSE body 未被读取；handler 与
+SSE 使用同一个 HTTP 去重标记。末步文本溢出时 `engine_completed` 已增加，HTTP
+错误仍增加，引擎 failed/cancelled 不回写。SSE 提前关闭在 body 被消费时记录错误。
+各项原子值独立读取，且引擎项在步末刷新，不是跨项事务快照，更不是客户端收到
+响应的网络确认。
+
+`RequestState::Cancelled(CancellationReason)` 与 `CompletedRequest.cancellation` 保留
+取消类型；`EngineMetrics.cancelled_requests` 单独计数。Rust 穷尽匹配与 struct literal
+需要更新，C ABI 不变。取消的 HTTP 错误信封保持原 500 / `internal_error` 形状，
+但不增加 `paged_errors_total`，因此该指标不是所有 HTTP 5xx 的计数。独立计数口径见
+[指标决策](.agents/notes/implemented/bug-fix/2026-10-04-typed-cancellation-and-metrics.md)。
 
 ### 库用法
 

@@ -7,8 +7,12 @@
 > 实现对齐：2026-10-04 整改分支复用主动取消实现；有界 mailbox、带外终态、
 > 直接拉取式多候选合并与 CPU 回收测试见
 > [实现决策](../../.agents/notes/implemented/feature/2026-10-04-bounded-events-and-cancellation.md)。
-> 当前实现与下文目标稿有三处明确差异：成功终态必须先排空文本（不能忽略残余 chunk）；
-> fan-in 没有第二层队列/转发任务；typed `Cancelled` 与完整指标口径仍未实施。
+> 类型化终态与指标实现见
+> [指标决策](../../.agents/notes/implemented/bug-fix/2026-10-04-typed-cancellation-and-metrics.md)。
+> 当前实现与下文冻结稿的差异：成功终态必须先排空文本；fan-in 没有第二层队列/转发
+> 任务；取消携带 `CancellationReason`，终态使用 `cancellation: Option<_>`，不是 bool；
+> `paged_engine_cancelled_requests` 按候选计数，HTTP errors 共享去重标记，不新增混淆
+> HTTP/候选单位的 `paged_requests_cancelled_total`。慢消费者溢出归为失败而非正常取消。
 > 下文按约 1KB 估计的内存数不是当前实现的字节上界，logprobs 与完整输出需另计。
 
 ## 1. Decision summary

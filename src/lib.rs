@@ -138,6 +138,7 @@ pub use tokenizer::{
     build_tokenizer, HuggingFaceTokenizer, IncrementalDecoder, SimpleTokenizer, TokenizerTrait,
 };
 pub use types::{
-    BlockIdx, CompletedRequest, ExecutionBatch, ExecutionOutput, GenerationParams, MemoryStats,
-    PhysicalBlockRef, Request, RequestId, RequestState, SchedulerOutput, SeqId, Sequence, TokenId,
+    BlockIdx, CancellationReason, CompletedRequest, ExecutionBatch, ExecutionOutput,
+    GenerationParams, MemoryStats, PhysicalBlockRef, Request, RequestId, RequestState,
+    SchedulerOutput, SeqId, Sequence, TokenId,
 };

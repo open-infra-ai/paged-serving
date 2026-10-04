@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- 2026-10-04 指标批次：`CancellationReason`、`RequestState::Cancelled`、
+  `CompletedRequest.cancellation`、`EngineMetrics.cancelled_requests` 与
+  `paged_engine_cancelled_requests`；全部暴露指标有 HELP/TYPE。
 - 请求 guard 主动取消、shutdown 广播与每候选有界文本 mailbox（默认 64、可配）；
   终态经独立 oneshot 投递，多候选直接拉取合并，CPU 测试覆盖静默 decode 断连、
   handler abort、部分准入、慢消费者、末步投递失败和 backend 回收。
@@ -16,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overflow 策略、指标语义口径与测试方式；待评审后分 PR 实现（P0-001/002/003）。
 
 ### Fixed
+- 2026-10-04 指标批次：JSON 拒绝、后端错误、SSE 提前关闭与慢消费者溢出纳入
+  HTTP 错误计数；多个候选、handler 与 SSE 共用去重标记，未消费 SSE 的后端
+  失败同样可观测。最后一步已计算成功时的文本溢出仍计 HTTP 失败，不改引擎成功事实。
 - 成功 SSE 终态先排空文本；满队列和末步投递失败返回错误而非伪装完整成功。
   `paged_inflight_requests` 覆盖 SSE body lifetime，而不在 handler 返回时提前递减。
 - 服务端不再因仅启用 `tiny-llm` 编译 feature 就被误认为正在使用真实 CUDA
@@ -26,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte-fallback 边界；中间片段与最终一次性 decode 保持严格等价。
 
 ### Changed
+- 2026-10-04 指标批次完成独立取消分类：engine failed 排除主动取消，慢消费者
+  溢出按失败统计；取消保持 HTTP 错误信封但不计 `paged_errors_total`。新增 public
+  enum 变体与 struct 字段是 Rust source-breaking change，穷尽匹配、struct literal
+  需迁移；C ABI 与 Cargo.lock 不变。此前“独立状态/指标待实现”的备注对应指标批次前基线。
 - `EngineConfig` 新增 `event_channel_capacity`，旧 JSON 缺省为 64；Rust 全字段构造需
   补字段或使用 `..Default::default()`。`EngineError` 新增 `ShuttingDown`、`ConfigError`
   新增 `InvalidEventChannelCapacity`（穷尽匹配需更新），

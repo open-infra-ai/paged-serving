@@ -24,11 +24,11 @@ use crate::config::EngineConfig;
 use crate::error::EngineError;
 use crate::kv_cache::KVCacheManager;
 use crate::types::{
-    ExecutionOutput, PhysicalBlockRef, Request, RequestId, RequestState, SchedulerOutput, SeqId,
-    Sequence, TokenId,
+    CancellationReason, ExecutionOutput, PhysicalBlockRef, Request, RequestId, RequestState,
+    SchedulerOutput, SeqId, Sequence, TokenId,
 };
 
-/// 取消请求的失败原因前缀；引擎据此把终态归类为"客户端取消"而非后端错误。
+/// 保留错误文案前缀；终态分类使用 CancellationReason，不解析此字符串。
 pub const CANCEL_REASON_PREFIX: &str = "request cancelled";
 
 #[derive(Debug, Clone)]
@@ -436,17 +436,26 @@ impl Scheduler {
     }
 
     /// 按 request_id 取消请求：无论它处于 pending、prefill 还是 decode，
-    /// 都将其标记失败并释放 KV 资源。返回是否真的取消到了东西。
+    /// 都将其标记取消并释放 KV 资源。返回是否真的取消到了东西。
     pub fn cancel_by_request_id(&mut self, request_id: RequestId) -> bool {
-        self.fail_by_request_id(
-            request_id,
-            &format!("{CANCEL_REASON_PREFIX}: client disconnected"),
-        )
+        self.cancel_by_request_id_with_reason(request_id, CancellationReason::ClientDisconnected)
+    }
+
+    pub fn cancel_by_request_id_with_reason(
+        &mut self,
+        request_id: RequestId,
+        reason: CancellationReason,
+    ) -> bool {
+        self.terminate_by_request_id(request_id, RequestState::Cancelled(reason))
     }
 
     /// 按 request_id 将请求标记为失败（释放 KV 资源），失败原因随请求排出。
     /// 返回是否找到了对应请求。
     pub fn fail_by_request_id(&mut self, request_id: RequestId, reason: &str) -> bool {
+        self.terminate_by_request_id(request_id, RequestState::Failed(reason.to_string()))
+    }
+
+    fn terminate_by_request_id(&mut self, request_id: RequestId, state: RequestState) -> bool {
         let seq_id = self
             .pending_queue
             .iter()
@@ -461,7 +470,7 @@ impl Scheduler {
             });
         match seq_id {
             Some(seq_id) => {
-                self.fail_sequence(seq_id, reason);
+                self.terminate_sequence(seq_id, state);
                 true
             }
             None => false,
@@ -639,15 +648,19 @@ impl Scheduler {
     }
 
     fn fail_sequence(&mut self, seq_id: SeqId, reason: &str) {
+        self.terminate_sequence(seq_id, RequestState::Failed(reason.to_string()));
+    }
+
+    fn terminate_sequence(&mut self, seq_id: SeqId, state: RequestState) {
         if let Some(mut sequence) = self.decode_sequences.remove(&seq_id) {
-            sequence.request.state = RequestState::Failed(reason.to_string());
+            sequence.request.state = state;
             self.kv_cache.free_sequence(seq_id);
             self.completed_requests.push((seq_id, sequence.request));
             return;
         }
 
         if let Some(mut sequence) = self.prefill_sequences.remove(&seq_id) {
-            sequence.request.state = RequestState::Failed(reason.to_string());
+            sequence.request.state = state;
             self.kv_cache.free_sequence(seq_id);
             self.completed_requests.push((seq_id, sequence.request));
             return;
@@ -655,7 +668,7 @@ impl Scheduler {
 
         if let Some(index) = self.pending_queue.iter().position(|p| p.seq_id == seq_id) {
             if let Some(mut pending) = self.pending_queue.remove(index) {
-                pending.request.state = RequestState::Failed(reason.to_string());
+                pending.request.state = state;
                 self.completed_requests.push((seq_id, pending.request));
             }
         }
@@ -1075,7 +1088,7 @@ mod tests {
     fn test_cancel_by_request_id_covers_all_stages_and_frees_kv() {
         let mut scheduler = Scheduler::new(create_test_config());
 
-        // request 1 留在 pending；request 2 推进到 decode
+        // request 1 保持 prefill；request 2 推进到 decode。
         let pending_seq = scheduler
             .add_request(create_test_request_with_params(1, 8, 10))
             .unwrap();
@@ -1099,7 +1112,16 @@ mod tests {
         assert!(scheduler.has_decode_sequence(active_seq));
         assert!(scheduler.get_memory_utilization() > 0.0);
 
-        // 取消 pending 请求
+        assert!(scheduler.prefill_sequences.contains_key(&pending_seq));
+        // request 3 在 schedule 之后提交，确实保持 pending。
+        let queued_seq = scheduler
+            .add_request(create_test_request_with_params(3, 8, 10))
+            .unwrap();
+        assert!(scheduler.has_pending_request(queued_seq));
+        assert!(scheduler.cancel_by_request_id(3));
+        assert!(!scheduler.has_pending_request(queued_seq));
+
+        // 取消 prefill 请求
         assert!(scheduler.cancel_by_request_id(1));
         assert!(!scheduler.has_pending_request(pending_seq));
 
@@ -1108,12 +1130,12 @@ mod tests {
         assert!(!scheduler.has_decode_sequence(active_seq));
         assert_eq!(scheduler.get_memory_utilization(), 0.0);
 
-        // 两个被取消的请求都应经正常完成通道以失败终态排出
+        // 三个阶段的取消都应经正常完成通道以类型化取消终态排出
         let completed = scheduler.get_completed();
-        assert_eq!(completed.len(), 2);
+        assert_eq!(completed.len(), 3);
         assert!(completed.iter().all(|r| matches!(
             &r.state,
-            RequestState::Failed(msg) if msg.contains("cancelled")
+            RequestState::Cancelled(CancellationReason::ClientDisconnected)
         )));
 
         // 未知 request_id 返回 false

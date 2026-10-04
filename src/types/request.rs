@@ -1,6 +1,6 @@
 //! 请求类型
 
-use super::{RequestId, RequestState, TokenId};
+use super::{CancellationReason, RequestId, RequestState, TokenId};
 
 /// 生成参数
 ///
@@ -195,6 +195,9 @@ pub struct CompletedRequest {
 
     /// 错误信息（失败时）
     pub error: Option<String>,
+
+    /// 主动取消时的类型化原因；失败和成功时为 None
+    pub cancellation: Option<CancellationReason>,
 
     /// 生成结束原因（成功时为 Some，失败/取消时为 None）
     pub finish_reason: Option<FinishReason>,

@@ -11,12 +11,12 @@ Status: implemented
 复用 PR #23（head `25811e35c2d978f39efd6eb9731dc6fadc9c8a25`）的 `RequestGuard`、watch 取消与 shutdown 入口，在独立整改分支集成，不合并或改动该 PR。
 
 - 每候选文本 mailbox 容量由 `EngineConfig.event_channel_capacity` 指定，默认 64，零容量拒绝；旧 JSON 缺省该字段仍可读取。Rust 全字段 struct literal 需要补新字段，无 C ABI 变化。
-- 引擎仅 `try_send`；队列满即取消该候选，错误文本为 `slow consumer: event channel overflow`。独立 oneshot 保证终态不受满队列阻挡。
+- 引擎仅 `try_send`；队列满即终止该候选，错误文本为 `slow consumer: event channel overflow`。独立 oneshot 保证终态不受满队列阻挡；失败与取消分类见 [类型化终态](../bug-fix/2026-10-04-typed-cancellation-and-metrics.md)。
 - 失败终态优先，丢弃剩余文本并输出 error 与 `[DONE]`；成功终态必须先排空已产生文本，再发送 usage 与 `[DONE]`。末步已经成功但文本投递溢出时，HTTP 仍失败，不能宣称完整成功。
 - unary 不订阅文本，直接等待终态，避免没有消费需求的 mailbox 误触发 overflow。
 - 多候选直接使用已有 futures-util 的 `SelectAll` 拉取各候选事件，删除 fan-in 队列与转发任务。队列项上界为 `n × capacity`，再加至多每候选一个合并器持有的事件；这不是字节上界，logprobs、输出历史与网络缓冲另计。
 - 引擎检出 shutdown 真值后不可逆退出：关闭 submission 接收端，取消已有请求，排空未准入队列并拒绝它们。watch 的版本变化不等于真值，`send(false)` 不应误取消；调用方触发 shutdown 后必须保持真值，不能把它当可撤销开关。
-- `inflight` 覆盖 SSE body lifetime；其余 typed Cancelled 状态与 cancelled/errors 完整指标口径保持单独任务，取消仍计入现有 engine failed 指标。
+- `inflight` 覆盖 SSE body lifetime；typed Cancelled 与 cancelled/errors 指标口径由 [指标决策](../bug-fix/2026-10-04-typed-cancellation-and-metrics.md) 接管，不改变队列和主动取消所有权。
 
 ## Review
 
@@ -40,4 +40,4 @@ Rust 1.88 的 `cargo check --locked --all-targets` 和 `cargo test --locked` 通
 
 ## Consequences
 
-文本队列具备可检查的项数上限，取消与终态不依赖文本生产；删除 fan-in 转发任务减少独立生命周期。代价是慢客户端获得明确失败，而非无限等待；Rust 全字段构造和错误枚举穷尽匹配需要更新。候选在引擎中已成功、但末步文本溢出时，引擎 completed 与 HTTP failed 是不同层级，不据此推导交付成功率。默认容量 64 未经真实网络负载调优；同步 backend step 结束前无法响应取消，HTTP 网络排空未设置 deadline。真实后端回收、独立取消计数、完整错误统计和网络负载调优仍是验证缺口。
+文本队列具备可检查的项数上限，取消与终态不依赖文本生产；删除 fan-in 转发任务减少独立生命周期。代价是慢客户端获得明确失败，而非无限等待；Rust 全字段构造和错误枚举穷尽匹配需要更新。候选在引擎中已成功、但末步文本溢出时，引擎 completed 与 HTTP failed 是不同层级，不据此推导交付成功率。默认容量 64 未经真实网络负载调优；同步 backend step 结束前无法响应取消，HTTP 网络排空未设置 deadline。真实后端回收和网络负载调优仍是验证缺口；独立取消与错误统计的验证由指标笔记维护。

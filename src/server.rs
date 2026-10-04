@@ -16,7 +16,9 @@ use crate::config::{EngineConfig, TokenizerKind};
 use crate::engine::EngineMetrics;
 use crate::error::EngineError;
 use crate::tokenizer::{build_tokenizer, TokenizerTrait};
-use crate::types::{CompletedRequest, FinishReason, GenerationParams, RequestId, TokenLogprobs};
+use crate::types::{
+    CancellationReason, CompletedRequest, FinishReason, GenerationParams, RequestId, TokenLogprobs,
+};
 use crate::InferenceEngine;
 use async_stream::stream;
 use axum::extract::rejection::JsonRejection;
@@ -30,7 +32,7 @@ use futures_util::{stream::SelectAll, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -50,7 +52,14 @@ struct ServerMetrics {
 impl ServerMetrics {
     fn render(&self) -> String {
         format!(
-            "# TYPE paged_requests_total counter\npaged_requests_total {}\n# TYPE paged_errors_total counter\npaged_errors_total {}\n# HELP paged_inflight_requests HTTP requests with an active handler or SSE body.\n# TYPE paged_inflight_requests gauge\npaged_inflight_requests {}\n# TYPE paged_streaming_requests_total counter\npaged_streaming_requests_total {}\n",
+            "# HELP paged_requests_total Completion and chat HTTP requests, including rejected requests.\n\
+             # TYPE paged_requests_total counter\npaged_requests_total {}\n\
+             # HELP paged_errors_total HTTP requests with rejection or generation/delivery failure, counted once; excludes cancellation.\n\
+             # TYPE paged_errors_total counter\npaged_errors_total {}\n\
+             # HELP paged_inflight_requests HTTP requests with an active handler or SSE body.\n\
+             # TYPE paged_inflight_requests gauge\npaged_inflight_requests {}\n\
+             # HELP paged_streaming_requests_total HTTP requests admitted to SSE, regardless of candidate count.\n\
+             # TYPE paged_streaming_requests_total counter\npaged_streaming_requests_total {}\n",
             self.requests_total.load(Ordering::Relaxed),
             self.errors_total.load(Ordering::Relaxed),
             self.inflight_requests.load(Ordering::Relaxed),
@@ -67,6 +76,7 @@ struct SharedEngineMetrics {
     kv_utilization_bp: AtomicU64,
     completed_requests: AtomicU64,
     failed_requests: AtomicU64,
+    cancelled_requests: AtomicU64,
     total_tokens_generated: AtomicU64,
 }
 
@@ -82,21 +92,31 @@ impl SharedEngineMetrics {
             .store(metrics.completed_requests, Ordering::Relaxed);
         self.failed_requests
             .store(metrics.failed_requests, Ordering::Relaxed);
+        self.cancelled_requests
+            .store(metrics.cancelled_requests, Ordering::Relaxed);
         self.total_tokens_generated
             .store(metrics.total_tokens_generated, Ordering::Relaxed);
     }
 
     fn render(&self) -> String {
         format!(
-            "# TYPE paged_engine_active_sequences gauge\npaged_engine_active_sequences {}\n\
+            "# HELP paged_engine_active_sequences Candidates in prefill or decode, excluding pending candidates.\n\
+             # TYPE paged_engine_active_sequences gauge\npaged_engine_active_sequences {}\n\
+             # HELP paged_engine_kv_utilization Logical KV block utilization as a fraction from 0 to 1.\n\
              # TYPE paged_engine_kv_utilization gauge\npaged_engine_kv_utilization {}\n\
+             # HELP paged_engine_completed_requests Successfully computed candidates, not HTTP delivery acknowledgements.\n\
              # TYPE paged_engine_completed_requests counter\npaged_engine_completed_requests {}\n\
+             # HELP paged_engine_failed_requests Failed candidates, excluding cancellation.\n\
              # TYPE paged_engine_failed_requests counter\npaged_engine_failed_requests {}\n\
+             # HELP paged_engine_cancelled_requests Candidates cancelled before completion, including client exit and shutdown.\n\
+             # TYPE paged_engine_cancelled_requests counter\npaged_engine_cancelled_requests {}\n\
+             # HELP paged_engine_tokens_generated_total Generated tokens from all terminal candidates, including failed or cancelled candidates.\n\
              # TYPE paged_engine_tokens_generated_total counter\npaged_engine_tokens_generated_total {}\n",
             self.active_sequences.load(Ordering::Relaxed),
             (self.kv_utilization_bp.load(Ordering::Relaxed) as f64) / 10_000.0,
             self.completed_requests.load(Ordering::Relaxed),
             self.failed_requests.load(Ordering::Relaxed),
+            self.cancelled_requests.load(Ordering::Relaxed),
             self.total_tokens_generated.load(Ordering::Relaxed),
         )
     }
@@ -107,21 +127,49 @@ impl SharedEngineMetrics {
 /// `fetch_sub`，会造成计数下溢（`AtomicU64` 绕回）。guard 应始终通过
 /// `InflightGuard::new` 构造并保持单一实例。
 struct InflightGuard {
-    metrics: Arc<ServerMetrics>,
+    outcome: Arc<HttpRequestOutcome>,
 }
 
 impl InflightGuard {
     fn new(metrics: &Arc<ServerMetrics>) -> Self {
         metrics.inflight_requests.fetch_add(1, Ordering::Relaxed);
         Self {
+            outcome: HttpRequestOutcome::new(metrics),
+        }
+    }
+}
+
+/// 所有候选、handler 和 SSE 共用一个 HTTP 错误记录对象。
+struct HttpRequestOutcome {
+    metrics: Arc<ServerMetrics>,
+    error_recorded: AtomicBool,
+}
+
+impl HttpRequestOutcome {
+    fn new(metrics: &Arc<ServerMetrics>) -> Arc<Self> {
+        Arc::new(Self {
             metrics: metrics.clone(),
+            error_recorded: AtomicBool::new(false),
+        })
+    }
+
+    fn record_error(&self) {
+        if !self.error_recorded.swap(true, Ordering::Relaxed) {
+            self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_api_error(&self, error: &ApiError) {
+        if !matches!(error, ApiError::Cancelled(_)) {
+            self.record_error();
         }
     }
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.metrics
+        self.outcome
+            .metrics
             .inflight_requests
             .fetch_sub(1, Ordering::Relaxed);
     }
@@ -137,6 +185,7 @@ struct Submission {
     events: EventSender,
     /// handler 的 RequestGuard Drop 置位；owner 消失也视为取消。
     cancel: watch::Receiver<bool>,
+    outcome: Arc<HttpRequestOutcome>,
 }
 
 /// handler 侧的请求所有权 guard：任何消费路径退出（事件 receiver drop、
@@ -159,7 +208,23 @@ impl Drop for RequestGuard {
 struct Waiter {
     events: EventSender,
     cancel: watch::Receiver<bool>,
-    delivery_error: Option<&'static str>,
+    delivery_error: Option<DeliveryError>,
+    outcome: Arc<HttpRequestOutcome>,
+}
+
+#[derive(Clone, Copy)]
+enum DeliveryError {
+    SlowConsumer,
+    Cancelled(CancellationReason),
+}
+
+impl DeliveryError {
+    fn message(self) -> String {
+        match self {
+            Self::SlowConsumer => "slow consumer: event channel overflow".to_string(),
+            Self::Cancelled(reason) => reason.to_string(),
+        }
+    }
 }
 
 struct EventSender {
@@ -226,7 +291,7 @@ struct Admission {
 enum RequestEvent {
     /// 新生成的文本片段（每生成一个 token 推送一次）及该 token 的 logprob。
     Chunk(String, Option<TokenLogprobs>),
-    /// 请求到达终态（成功或失败）。
+    /// 请求到达终态（成功、失败或取消）。
     Done(CompletedRequest),
 }
 
@@ -236,8 +301,15 @@ fn dispatch_completed(waiters: &mut HashMap<RequestId, Waiter>, completed: Vec<C
         if let Some(waiter) = waiters.remove(&completed.request_id) {
             if let Some(error) = waiter.delivery_error {
                 completed.success = false;
-                completed.error = Some(error.to_string());
+                completed.error = Some(error.message());
+                completed.cancellation = match error {
+                    DeliveryError::SlowConsumer => None,
+                    DeliveryError::Cancelled(reason) => Some(reason),
+                };
                 completed.finish_reason = None;
+            }
+            if !completed.success && completed.cancellation.is_none() {
+                waiter.outcome.record_error();
             }
             // 成功终态到达时 chunks 已封口，消费者可有限地排空。
             drop(waiter.events.chunks);
@@ -269,6 +341,7 @@ impl AppState {
         prompt: &str,
         params: GenerationParams,
         streaming: bool,
+        outcome: Arc<HttpRequestOutcome>,
     ) -> Result<(Admission, RequestEvents, RequestGuard), ApiError> {
         let (admit_tx, admit_rx) = oneshot::channel();
         let (mut events_tx, events_rx) =
@@ -287,6 +360,7 @@ impl AppState {
                 admit: admit_tx,
                 events: events_tx,
                 cancel: cancel_rx,
+                outcome,
             })
             .await
             .map_err(|_| ApiError::internal("engine loop is not running"))?;
@@ -301,10 +375,11 @@ impl AppState {
         &self,
         prompt: &str,
         params: GenerationParams,
+        outcome: Arc<HttpRequestOutcome>,
     ) -> Result<GenerationResult, ApiError> {
         // _guard 覆盖整个等待窗口：future 被 abort（client 断连）或任何
         // 提前返回时 Drop 置位，引擎循环下一步检出并释放资源。
-        let (admission, events, _guard) = self.submit(prompt, params, false).await?;
+        let (admission, events, _guard) = self.submit(prompt, params, false, outcome).await?;
         let completed = events
             .done
             .expect("new submission has a terminal receiver")
@@ -337,11 +412,18 @@ fn generation_result(
             logprobs: completed.logprobs,
         })
     } else {
-        Err(ApiError::internal(
+        Err(completed_error(completed))
+    }
+}
+
+fn completed_error(completed: CompletedRequest) -> ApiError {
+    match completed.cancellation {
+        Some(reason) => ApiError::Cancelled(reason),
+        None => ApiError::internal(
             completed
                 .error
-                .unwrap_or_else(|| "generation failed".to_string()),
-        ))
+                .unwrap_or_else(|| "generation failed".into()),
+        ),
     }
 }
 
@@ -350,11 +432,18 @@ fn generation_result(
 /// 将引擎分层错误映射到恰当的状态码：
 /// 验证错误 → 400，过载（内存压力 / 并发上限）→ 429（含 `Retry-After`），
 /// 资源不存在 → 404，其余内部错误 → 500。
+#[derive(Debug, thiserror::Error)]
 enum ApiError {
+    #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
     NotFound(String),
+    #[error("{0}")]
     Overloaded(String),
+    #[error("{0}")]
     Internal(String),
+    #[error("{0}")]
+    Cancelled(CancellationReason),
 }
 
 impl ApiError {
@@ -377,6 +466,7 @@ impl From<EngineError> for ApiError {
             EngineError::MemoryPressure | EngineError::MaxConcurrentSequencesReached(_) => {
                 ApiError::Overloaded(err.to_string())
             }
+            EngineError::ShuttingDown => ApiError::Cancelled(CancellationReason::ServerShutdown),
             _ => ApiError::Internal(err.to_string()),
         }
     }
@@ -389,6 +479,11 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, "invalid_request_error", m),
             ApiError::Overloaded(m) => (StatusCode::TOO_MANY_REQUESTS, "overloaded_error", m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", m),
+            ApiError::Cancelled(reason) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                reason.to_string(),
+            ),
         };
         let mut response = Json(serde_json::json!({
             "error": { "message": message, "type": error_type }
@@ -815,19 +910,21 @@ fn cancel_flagged(
 ) {
     let shutdown = *shutdown_rx.borrow();
     let mut flagged: Vec<RequestId> = Vec::new();
-    for (id, waiter) in waiters.iter_mut() {
+    for (id, waiter) in waiters.iter() {
         if shutdown || *waiter.cancel.borrow() || waiter.cancel.has_changed().is_err() {
-            if shutdown {
-                waiter.delivery_error = Some("request cancelled: server shutting down");
-            }
             flagged.push(*id);
         }
     }
     if flagged.is_empty() {
         return;
     }
+    let reason = if shutdown {
+        CancellationReason::ServerShutdown
+    } else {
+        CancellationReason::ClientDisconnected
+    };
     for id in flagged {
-        engine.cancel_request(id);
+        engine.cancel_request_with_reason(id, reason);
     }
     let (completed, _) = engine.collect_completed_requests();
     dispatch_completed(waiters, completed);
@@ -894,7 +991,7 @@ async fn engine_loop(
             Ok(events) => {
                 let completed_len = events.completed.len();
                 let chunks_len = events.chunks.len();
-                let mut undeliverable: Vec<RequestId> = Vec::new();
+                let mut undeliverable: Vec<(RequestId, DeliveryError)> = Vec::new();
                 for (request_id, chunk, logprobs) in events.chunks {
                     if let Some(waiter) = waiters.get_mut(&request_id) {
                         if let Some(tx) = &waiter.events.chunks {
@@ -902,22 +999,31 @@ async fn engine_loop(
                                 match tx.try_send(RequestEvent::Chunk(chunk, logprobs)) {
                                     Ok(()) => {}
                                     Err(mpsc::error::TrySendError::Full(_)) => {
-                                        waiter.delivery_error =
-                                            Some("slow consumer: event channel overflow");
-                                        undeliverable.push(request_id);
+                                        waiter.delivery_error = Some(DeliveryError::SlowConsumer);
+                                        undeliverable
+                                            .push((request_id, DeliveryError::SlowConsumer));
                                     }
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        waiter.delivery_error =
-                                            Some("request cancelled: client disconnected");
-                                        undeliverable.push(request_id);
+                                        let error = DeliveryError::Cancelled(
+                                            CancellationReason::ClientDisconnected,
+                                        );
+                                        waiter.delivery_error = Some(error);
+                                        undeliverable.push((request_id, error));
                                     }
                                 }
                             }
                         }
                     }
                 }
-                for request_id in undeliverable {
-                    engine.cancel_request(request_id);
+                for (request_id, error) in undeliverable {
+                    match error {
+                        DeliveryError::SlowConsumer => {
+                            engine.fail_request(request_id, &error.message());
+                        }
+                        DeliveryError::Cancelled(reason) => {
+                            engine.cancel_request_with_reason(request_id, reason);
+                        }
+                    }
                 }
                 dispatch_completed(&mut waiters, events.completed);
                 // 取消后可能已无 pending work；必须当步派发，不能等待下一次提交。
@@ -991,6 +1097,7 @@ fn admit_submission(
                 events: submission.events,
                 cancel: submission.cancel,
                 delivery_error: None,
+                outcome: submission.outcome,
             },
         );
     }
@@ -1044,13 +1151,16 @@ async fn completions(
 
     let Json(request) = match body {
         Ok(json) => json,
-        Err(rejection) => return ApiError::BadRequest(rejection.body_text()).into_response(),
+        Err(rejection) => {
+            _guard.outcome.record_error();
+            return ApiError::BadRequest(rejection.body_text()).into_response();
+        }
     };
 
     let prepared = match prepare_completion_request(&state, request) {
         Ok(prepared) => prepared,
         Err(err) => {
-            state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            _guard.outcome.record_api_error(&err);
             return err.into_response();
         }
     };
@@ -1067,13 +1177,16 @@ async fn chat_completions(
 
     let Json(request) = match body {
         Ok(json) => json,
-        Err(rejection) => return ApiError::BadRequest(rejection.body_text()).into_response(),
+        Err(rejection) => {
+            _guard.outcome.record_error();
+            return ApiError::BadRequest(rejection.body_text()).into_response();
+        }
     };
 
     let prepared = match prepare_chat_request(&state, request) {
         Ok(prepared) => prepared,
         Err(err) => {
-            state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            _guard.outcome.record_api_error(&err);
             return err.into_response();
         }
     };
@@ -1097,7 +1210,12 @@ async fn respond_generation(
         let mut prompt_tokens = 0;
         for _ in 0..prepared.n {
             match state
-                .submit(&prepared.prompt, prepared.params.clone(), true)
+                .submit(
+                    &prepared.prompt,
+                    prepared.params.clone(),
+                    true,
+                    inflight.outcome.clone(),
+                )
                 .await
             {
                 Ok((admission, events, guard)) => {
@@ -1111,7 +1229,7 @@ async fn respond_generation(
                     // n>1 部分准入失败：drop 已收集的 guards → 主动取消
                     // 已准入候选，不再等下一次 chunk send 失败回收。
                     drop(guards);
-                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    inflight.outcome.record_api_error(&err);
                     return err.into_response();
                 }
             }
@@ -1141,7 +1259,10 @@ async fn respond_generation(
         }
     } else if prepared.n == 1 {
         let k = prepared.params.logprobs.unwrap_or(1);
-        match state.generate(&prepared.prompt, prepared.params).await {
+        match state
+            .generate(&prepared.prompt, prepared.params, inflight.outcome.clone())
+            .await
+        {
             Ok(generated) => match kind {
                 StreamKind::Completion => {
                     let logprobs = choice_logprobs(state, &generated, k);
@@ -1184,13 +1305,13 @@ async fn respond_generation(
                 }
             },
             Err(err) => {
-                state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                inflight.outcome.record_api_error(&err);
                 err.into_response()
             }
         }
     } else {
         // 非流式 n>1：并行生成 n 个候选，响应含 n 个 choices
-        match generate_many(state, &prepared).await {
+        match generate_many(state, &prepared, &inflight.outcome).await {
             Ok(generated) => {
                 match kind {
                     StreamKind::Completion => {
@@ -1247,7 +1368,7 @@ async fn respond_generation(
                 }
             }
             Err(err) => {
-                state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                inflight.outcome.record_api_error(&err);
                 err.into_response()
             }
         }
@@ -1424,7 +1545,7 @@ fn stream_response(
         // → guard Drop 置位取消信号，engine loop 下一步检出（主动取消）。
         let _guard = guard;
         let _inflight = inflight;
-        let mut failure: Option<String> = None;
+        let mut failure: Option<ApiError> = None;
         let mut terminated = false;
         while let Some(event) = events.recv().await {
             match event {
@@ -1456,7 +1577,7 @@ fn stream_response(
                             .data(kind.final_payload(&id, created, &model, &usage, finish_reason)
                                 .to_string()));
                     } else {
-                        failure = Some(completed.error.unwrap_or_else(|| "generation failed".into()));
+                        failure = Some(completed_error(completed));
                     }
                     break;
                 }
@@ -1465,17 +1586,12 @@ fn stream_response(
         if !terminated {
             // 通道关闭但从未收到终态（如引擎循环异常退出）：
             // 明确报错而不是伪装成正常结束。
-            let payload = serde_json::json!({
-                "error": {
-                    "message": "engine loop ended before request completed",
-                    "type": "internal_error"
-                }
-            });
-            yield Ok::<Event, Infallible>(Event::default().data(payload.to_string()));
+            failure = Some(ApiError::internal("engine loop ended before request completed"));
         }
-        if let Some(message) = failure {
+        if let Some(error) = failure {
+            _inflight.outcome.record_api_error(&error);
             let payload = serde_json::json!({
-                "error": { "message": message, "type": "internal_error" }
+                "error": { "message": error.to_string(), "type": "internal_error" }
             });
             yield Ok::<Event, Infallible>(Event::default().data(payload.to_string()));
         }
@@ -1523,7 +1639,7 @@ fn stream_response_multi(
             }));
         }
 
-        let mut failure: Option<String> = None;
+        let mut failure: Option<ApiError> = None;
         let mut terminated = false;
         let mut remaining = n;
         let mut finish_reasons: Vec<Option<String>> = vec![None; n];
@@ -1556,7 +1672,7 @@ fn stream_response_multi(
                         );
                         completion_tokens[i] = completed.output_tokens.len();
                     } else {
-                        failure = Some(completed.error.unwrap_or_else(|| "generation failed".into()));
+                        failure = Some(completed_error(completed));
                         break;
                     }
                     if remaining == 0 {
@@ -1583,17 +1699,12 @@ fn stream_response_multi(
         drop(merged);
         if !terminated && failure.is_none() {
             // 通道关闭但未收到全部终态：明确报错而非伪装成正常结束
-            let payload = serde_json::json!({
-                "error": {
-                    "message": "engine loop ended before all candidates completed",
-                    "type": "internal_error"
-                }
-            });
-            yield Ok::<Event, Infallible>(Event::default().data(payload.to_string()));
+            failure = Some(ApiError::internal("engine loop ended before all candidates completed"));
         }
-        if let Some(message) = failure {
+        if let Some(error) = failure {
+            _inflight.outcome.record_api_error(&error);
             let payload = serde_json::json!({
-                "error": { "message": message, "type": "internal_error" }
+                "error": { "message": error.to_string(), "type": "internal_error" }
             });
             yield Ok::<Event, Infallible>(Event::default().data(payload.to_string()));
         }
@@ -1785,13 +1896,15 @@ fn usage_multi(results: &[GenerationResult]) -> Usage {
 async fn generate_many(
     state: &Arc<AppState>,
     prepared: &PreparedGenerationRequest,
+    outcome: &Arc<HttpRequestOutcome>,
 ) -> Result<Vec<GenerationResult>, ApiError> {
     let mut set = JoinSet::new();
     for _ in 0..prepared.n {
         let state = state.clone();
         let prompt = prepared.prompt.clone();
         let params = prepared.params.clone();
-        set.spawn(async move { state.generate(&prompt, params).await });
+        let outcome = outcome.clone();
+        set.spawn(async move { state.generate(&prompt, params, outcome).await });
     }
     let mut generated = Vec::with_capacity(prepared.n);
     while let Some(result) = set.join_next().await {
@@ -2055,7 +2168,15 @@ mod tests {
         prompt: &str,
         params: GenerationParams,
     ) -> (Admission, RequestEvents, RequestGuard) {
-        match state.submit(prompt, params, true).await {
+        match state
+            .submit(
+                prompt,
+                params,
+                true,
+                HttpRequestOutcome::new(&state.metrics),
+            )
+            .await
+        {
             Ok(v) => v,
             Err(_) => panic!("submit must succeed"),
         }
@@ -2091,6 +2212,7 @@ mod tests {
 
     fn assert_cancelled(done: &CompletedRequest) {
         assert!(!done.success, "cancelled request must not be success");
+        assert!(done.cancellation.is_some(), "cancellation must be typed");
         let msg = done.error.as_deref().unwrap_or("");
         assert!(
             msg.contains("cancelled"),
@@ -2198,6 +2320,7 @@ mod tests {
                 admit: admit_tx,
                 events: events_tx,
                 cancel: cancel_rx,
+                outcome: HttpRequestOutcome::new(&Arc::new(ServerMetrics::default())),
             },
             &mut waiters,
         );
@@ -2238,6 +2361,7 @@ mod tests {
                 events: events_tx,
                 cancel: cancel_rx,
                 delivery_error: None,
+                outcome: HttpRequestOutcome::new(&Arc::new(ServerMetrics::default())),
             },
         );
         let (_shutdown_keepalive, shutdown_rx) = watch::channel(false);
@@ -2330,7 +2454,16 @@ mod tests {
         await_chunk(&mut events1).await;
 
         // 候选 2 准入必然失败（并发上限）。
-        match harness.state.submit("second", test_params(8), true).await {
+        match harness
+            .state
+            .submit(
+                "second",
+                test_params(8),
+                true,
+                HttpRequestOutcome::new(&harness.state.metrics),
+            )
+            .await
+        {
             Err(ApiError::Overloaded(_)) => {}
             _ => panic!("candidate 2 must fail admission with Overloaded"),
         }
@@ -2417,7 +2550,15 @@ mod tests {
         );
         drop(guard);
         // unary 不订阅文本，即使容量 1、输出远大于容量也必须成功。
-        let generated = match harness.state.generate("healthy", test_params(100)).await {
+        let generated = match harness
+            .state
+            .generate(
+                "healthy",
+                test_params(100),
+                HttpRequestOutcome::new(&harness.state.metrics),
+            )
+            .await
+        {
             Ok(generated) => generated,
             Err(_) => panic!("slow client must not stall a subsequent unary request"),
         };
@@ -2450,6 +2591,28 @@ mod tests {
             Some("slow consumer: event channel overflow")
         );
         assert!(done.finish_reason.is_none());
+        assert!(
+            done.cancellation.is_none(),
+            "overflow is failure, not cancellation"
+        );
+        assert_eq!(
+            harness.state.metrics.errors_total.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            harness
+                .engine_metrics
+                .failed_requests
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            harness
+                .engine_metrics
+                .cancelled_requests
+                .load(Ordering::Relaxed),
+            0
+        );
         assert_eq!(done.output_tokens.len(), 2);
         assert_eq!(probe.finished.lock().unwrap().len(), 1);
         assert!(next_event(&mut events).await.is_none());
@@ -2492,7 +2655,15 @@ mod tests {
         let (harness, probe) = spawn_probe(config, TEST_TOKEN, None);
         let (_admission, mut slow_events, _guard) =
             submit_ok(&harness.state, "slow", test_params(1000)).await;
-        match harness.state.generate("healthy", test_params(100)).await {
+        match harness
+            .state
+            .generate(
+                "healthy",
+                test_params(100),
+                HttpRequestOutcome::new(&harness.state.metrics),
+            )
+            .await
+        {
             Ok(generated) => assert_eq!(generated.completion_tokens, 100),
             Err(_) => panic!("bounded stream must not block another request"),
         }
@@ -2569,7 +2740,12 @@ mod tests {
             .unwrap();
         assert!(harness
             .state
-            .submit("after shutdown", test_params(1), true)
+            .submit(
+                "after shutdown",
+                test_params(1),
+                true,
+                HttpRequestOutcome::new(&harness.state.metrics)
+            )
             .await
             .is_err());
         assert_eq!(probe.finished.lock().unwrap().len(), 1);
@@ -2596,6 +2772,7 @@ mod tests {
                     admit,
                     events,
                     cancel: cancel_rx,
+                    outcome: HttpRequestOutcome::new(&harness.state.metrics),
                 })
                 .is_ok());
         }
@@ -2629,6 +2806,7 @@ mod tests {
                 output_tokens: Vec::new(),
                 success: false,
                 error: Some("candidate failure".into()),
+                cancellation: None,
                 finish_reason: None,
                 logprobs: None,
             })
@@ -2657,6 +2835,10 @@ mod tests {
             .unwrap();
         let text = std::str::from_utf8(first.data_ref().unwrap()).unwrap();
         assert!(text.contains("candidate failure"));
+        assert_eq!(
+            harness.state.metrics.errors_total.load(Ordering::Relaxed),
+            1
+        );
         assert!(!text.contains("[DONE]"));
         assert!(
             *cancel_b_rx.borrow(),
@@ -2671,5 +2853,58 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn premature_sse_closure_counts_one_http_error_for_single_and_multi() {
+        use axum::body::to_bytes;
+
+        for n in [1, 3] {
+            let (harness, _) = spawn_probe(create_test_config(), TEST_TOKEN, None);
+            let mut streams = Vec::new();
+            let mut guards = Vec::new();
+            for _ in 0..n {
+                let (sender, events) = request_event_channel(1);
+                drop(sender); // 引擎消失，没有 Done。
+                streams.push(events);
+                let (cancel, _) = watch::channel(false);
+                guards.push(RequestGuard { cancel });
+            }
+            let ctx = StreamContext {
+                state: &harness.state,
+                kind: StreamKind::Completion,
+                id_prefix: "cmpl",
+                model: "test-model",
+                prompt_tokens: 1,
+                k: 1,
+                inflight: InflightGuard::new(&harness.state.metrics),
+            };
+            let response = if n == 1 {
+                stream_response(ctx, streams.pop().unwrap(), guards.pop().unwrap())
+            } else {
+                stream_response_multi(ctx, streams, guards)
+            };
+            let body = timeout(EVENT_TIMEOUT, to_bytes(response.into_body(), usize::MAX))
+                .await
+                .unwrap()
+                .unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert!(text.contains("engine loop ended before"));
+            assert_eq!(text.matches("\"error\"").count(), 1);
+            assert_eq!(text.matches("data: [DONE]").count(), 1);
+            assert!(!text.contains("\"usage\""));
+            assert_eq!(
+                harness.state.metrics.errors_total.load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                harness
+                    .state
+                    .metrics
+                    .inflight_requests
+                    .load(Ordering::Relaxed),
+                0
+            );
+        }
     }
 }

@@ -96,7 +96,165 @@ async fn test_metrics_endpoint_exposes_prometheus_counters() {
     assert!(body.contains("paged_engine_kv_utilization"));
     assert!(body.contains("paged_engine_completed_requests"));
     assert!(body.contains("paged_engine_failed_requests"));
+    assert!(body.contains("paged_engine_cancelled_requests"));
     assert!(body.contains("paged_engine_tokens_generated_total"));
+    for name in [
+        "paged_requests_total",
+        "paged_errors_total",
+        "paged_inflight_requests",
+        "paged_streaming_requests_total",
+        "paged_engine_active_sequences",
+        "paged_engine_kv_utilization",
+        "paged_engine_completed_requests",
+        "paged_engine_failed_requests",
+        "paged_engine_cancelled_requests",
+        "paged_engine_tokens_generated_total",
+    ] {
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with(&format!("# HELP {name} ")))
+                .count(),
+            1
+        );
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with(&format!("# TYPE {name} ")))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_json_and_validation_rejections_are_counted_once() {
+    let app = create_router(create_test_config()).unwrap();
+    // 两个 handler 的 JSON 提取失败和准备参数失败均必须记账。
+    for (index, (uri, body)) in [
+        ("/v1/completions", "{"),
+        ("/v1/chat/completions", "{"),
+        ("/v1/completions", r#"{"prompt":"ok","max_tokens":0}"#),
+        ("/v1/chat/completions", r#"{"messages":[]}"#),
+        ("/v1/completions", r#"{"prompt":"ok","temperature":1}"#),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        wait_for_metric(&app, &format!("paged_requests_total {}", index + 1)).await;
+        wait_for_metric(&app, &format!("paged_errors_total {}", index + 1)).await;
+        wait_for_metric(&app, "paged_inflight_requests 0").await;
+    }
+    wait_for_metric(&app, "paged_streaming_requests_total 0").await;
+    wait_for_metric(&app, "paged_engine_failed_requests 0").await;
+}
+
+#[tokio::test]
+async fn test_backend_errors_count_once_for_unary_and_unpolled_sse() {
+    for streaming in [false, true] {
+        for n in [1, 3] {
+            let config = create_test_config();
+            let engine = InferenceEngine::with_components(
+                config.clone(),
+                Box::new(SimpleTokenizer::without_special_tokens()),
+                Scheduler::new(config.clone()),
+                Box::new(AlwaysFailExecutor),
+            )
+            .unwrap();
+            let app = create_router_with_engine(config, engine).unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "prompt":"failure", "max_tokens":4, "stream":streaming, "n":n,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if streaming {
+                    StatusCode::OK
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            );
+            // 先不读取 body：引擎的失败记录已经可见。
+            wait_for_metric(&app, "paged_errors_total 1").await;
+            wait_for_metric(&app, "paged_requests_total 1").await;
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert_eq!(text.matches("\"error\"").count(), 1);
+            if streaming {
+                assert_eq!(text.matches("data: [DONE]").count(), 1);
+                assert!(!text.contains("\"usage\""));
+                wait_for_metric(&app, "paged_streaming_requests_total 1").await;
+            } else {
+                wait_for_metric(&app, "paged_streaming_requests_total 0").await;
+            }
+            wait_for_metric(&app, "paged_errors_total 1").await;
+            wait_for_metric(&app, "paged_inflight_requests 0").await;
+            wait_for_metric(&app, "paged_engine_active_sequences 0").await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_shutdown_unary_is_typed_cancellation_not_generation_error() {
+    let config = create_test_config();
+    let (app, shutdown) =
+        create_router_with_engine_and_shutdown(config.clone(), constant_engine(&config, 0))
+            .unwrap();
+    let request_app = app.clone();
+    let task = tokio::spawn(async move {
+        request_app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"prompt":"silent", "max_tokens":1000}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    wait_for_metric(&app, "paged_engine_active_sequences 1").await;
+    shutdown.send(true).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(std::str::from_utf8(&body)
+        .unwrap()
+        .contains("server shutting down"));
+    wait_for_metric(&app, "paged_engine_cancelled_requests 1").await;
+    wait_for_metric(&app, "paged_engine_failed_requests 0").await;
+    wait_for_metric(&app, "paged_errors_total 0").await;
+    wait_for_metric(&app, "paged_inflight_requests 0").await;
 }
 
 #[tokio::test]
@@ -658,6 +816,10 @@ async fn test_completions_returns_429_when_overloaded() {
             );
         }
     }
+    wait_for_metric(&app, "paged_requests_total 2").await;
+    wait_for_metric(&app, "paged_errors_total 1").await;
+    wait_for_metric(&app, "paged_engine_completed_requests 1").await;
+    wait_for_metric(&app, "paged_inflight_requests 0").await;
 }
 
 /// 统计被执行的序列数并人为放慢每步，用于证明：
@@ -698,7 +860,7 @@ async fn metrics_text(app: &axum::Router) -> String {
 }
 
 /// 有界轮询 /metrics 直至出现目标行：指标快照由引擎循环每步刷新，
-/// 观测到 `paged_engine_failed_requests 1` 即证明终态已排出、槽位已释放。
+/// 观测到目标终态计数即证明终态已排出、槽位已释放。
 async fn wait_for_metric(app: &axum::Router, needle: &str) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -748,6 +910,8 @@ async fn test_slow_sse_has_error_terminal_even_with_full_mailbox() {
     assert_eq!(response.status(), StatusCode::OK);
     // 保留响应体但不 poll，明确制造慢消费者；HTTP handler 已返回。
     wait_for_metric(&app, "paged_engine_failed_requests 1").await;
+    wait_for_metric(&app, "paged_errors_total 1").await;
+    wait_for_metric(&app, "paged_engine_cancelled_requests 0").await;
     wait_for_metric(&app, "paged_inflight_requests 1").await;
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
@@ -768,11 +932,15 @@ async fn test_multi_candidate_slow_sse_is_bounded_and_fails_as_a_whole() {
     let app = create_router_with_engine(config.clone(), constant_engine(&config, 37)).unwrap();
     let response = app.clone().oneshot(stream_request(2, 500)).await.unwrap();
     wait_for_metric(&app, "paged_engine_failed_requests 2").await;
+    wait_for_metric(&app, "paged_errors_total 1").await;
+    wait_for_metric(&app, "paged_requests_total 1").await;
+    wait_for_metric(&app, "paged_streaming_requests_total 1").await;
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("slow consumer: event channel overflow"));
     assert_eq!(text.matches("data: [DONE]").count(), 1);
     assert!(!text.contains("\"usage\""));
+    wait_for_metric(&app, "paged_errors_total 1").await;
     wait_for_metric(&app, "paged_inflight_requests 0").await;
     wait_for_metric(&app, "paged_engine_kv_utilization 0").await;
 }
@@ -785,7 +953,11 @@ async fn test_unpolled_multi_body_drop_cancels_silent_candidates() {
     wait_for_metric(&app, "paged_engine_active_sequences 3").await;
     wait_for_metric(&app, "paged_inflight_requests 1").await;
     drop(response);
-    wait_for_metric(&app, "paged_engine_failed_requests 3").await;
+    wait_for_metric(&app, "paged_engine_cancelled_requests 3").await;
+    wait_for_metric(&app, "paged_engine_failed_requests 0").await;
+    wait_for_metric(&app, "paged_errors_total 0").await;
+    wait_for_metric(&app, "paged_requests_total 1").await;
+    wait_for_metric(&app, "paged_streaming_requests_total 1").await;
     wait_for_metric(&app, "paged_engine_active_sequences 0").await;
     wait_for_metric(&app, "paged_engine_kv_utilization 0").await;
     wait_for_metric(&app, "paged_inflight_requests 0").await;
@@ -800,11 +972,13 @@ async fn test_shutdown_terminates_silent_sse_and_readiness() {
     let response = app.clone().oneshot(stream_request(1, 1000)).await.unwrap();
     wait_for_metric(&app, "paged_engine_active_sequences 1").await;
     shutdown.send(true).unwrap();
-    wait_for_metric(&app, "paged_engine_failed_requests 1").await;
+    wait_for_metric(&app, "paged_engine_cancelled_requests 1").await;
+    wait_for_metric(&app, "paged_engine_failed_requests 0").await;
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("request cancelled"));
     assert_eq!(text.matches("data: [DONE]").count(), 1);
+    wait_for_metric(&app, "paged_errors_total 0").await;
     let readiness = app
         .oneshot(
             Request::builder()
@@ -850,6 +1024,11 @@ async fn test_completed_multi_sse_drains_text_before_usage() {
     }
     assert!(final_seen);
     assert_eq!(text.matches("data: [DONE]").count(), 1);
+    wait_for_metric(&app, "paged_requests_total 1").await;
+    wait_for_metric(&app, "paged_streaming_requests_total 1").await;
+    wait_for_metric(&app, "paged_errors_total 0").await;
+    wait_for_metric(&app, "paged_engine_cancelled_requests 0").await;
+    wait_for_metric(&app, "paged_inflight_requests 0").await;
 }
 
 #[tokio::test]
@@ -904,8 +1083,10 @@ async fn test_client_disconnect_cancels_generation() {
     assert!(saw_chunk, "stream should produce at least one token chunk");
     drop(body);
 
-    // 确定性屏障：取消终态被排出（取消计入 failed_requests）。
-    wait_for_metric(&metrics_app, "paged_engine_failed_requests 1").await;
+    // 确定性屏障：类型化取消终态被排出，服务错误计数不受影响。
+    wait_for_metric(&metrics_app, "paged_engine_cancelled_requests 1").await;
+    wait_for_metric(&metrics_app, "paged_engine_failed_requests 0").await;
+    wait_for_metric(&metrics_app, "paged_errors_total 0").await;
 
     // 断连后执行计数必须停下来：间隔采样两次，不再增长。
     // （若无取消机制，5ms/步的引擎会在两次采样间推进上百步。）
@@ -966,7 +1147,8 @@ async fn test_unary_future_abort_cancels_request() {
     task.abort();
 
     // guard Drop → 主动取消 → 终态排出 → 序列槽位释放。
-    wait_for_metric(&metrics_app, "paged_engine_failed_requests 1").await;
+    wait_for_metric(&metrics_app, "paged_engine_cancelled_requests 1").await;
+    wait_for_metric(&metrics_app, "paged_errors_total 0").await;
     wait_for_metric(&metrics_app, "paged_engine_active_sequences 0").await;
 }
 
@@ -1019,7 +1201,9 @@ async fn test_streaming_n2_partial_admission_cancels_admitted_candidate() {
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 
     // 屏障：候选 1 的取消终态已排出（槽位此刻已释放）。
-    wait_for_metric(&metrics_app, "paged_engine_failed_requests 1").await;
+    wait_for_metric(&metrics_app, "paged_engine_cancelled_requests 1").await;
+    wait_for_metric(&metrics_app, "paged_engine_failed_requests 0").await;
+    wait_for_metric(&metrics_app, "paged_errors_total 1").await;
 
     // 行为级证明：新请求立即准入成功（若槽位未释放会得到 429）。
     let follow_up = app

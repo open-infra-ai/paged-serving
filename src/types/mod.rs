@@ -26,7 +26,7 @@ pub type BlockIdx = u32;
 ///
 /// ```text
 /// Pending → Prefill → Decode → Completed
-///                     ↘ Failed
+/// 每个非终态也可转为 Failed 或 Cancelled
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestState {
@@ -44,6 +44,25 @@ pub enum RequestState {
 
     /// 失败，包含错误信息
     Failed(String),
+
+    /// 主动取消，不计入后端失败
+    Cancelled(CancellationReason),
+}
+
+/// 请求主动取消的原因；错误文案不参与指标分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationReason {
+    ClientDisconnected,
+    ServerShutdown,
+}
+
+impl std::fmt::Display for CancellationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ClientDisconnected => "request cancelled: client disconnected",
+            Self::ServerShutdown => "request cancelled: server shutting down",
+        })
+    }
 }
 
 pub mod execution;

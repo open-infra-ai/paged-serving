@@ -32,3 +32,7 @@ TPOT，同一二进制零改动覆盖 paged-serving / llama-server / vLLM 横向
 
 commit `54e7ae8`（PR #21，2026-09-15）；测试在 `cargo test` 内自起
 本地服务器完成真实 HTTP/SSE 往返。
+
+CLI 参数、预热/测量窗口与结果落盘由
+[CLI 复现笔记](2026-10-04-loadgen-cli-reproducibility.md) 单独维护；本篇的单请求分类
+与 TTFT/inter-chunk/token coverage 口径保持不变。

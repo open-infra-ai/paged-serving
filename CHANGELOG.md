@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- 2026-10-04 CLI 批次：真实 loadgen 二进制与本地 TCP/SSE 的完整结果落盘回归，
+  覆盖 closed/Poisson、warmup 排除、错误详情、token coverage 和自定义 summary 路径。
+  原始请求增加 nullable `scheduled_arrival_ms` / `dispatch_offset_ms`，summary.config
+  增加 `arrival_schedule` 标记，作为 schema v1 的可选扩展；历史结果缺字段表示未采集。
 - 2026-10-04 指标批次：`CancellationReason`、`RequestState::Cancelled`、
   `CompletedRequest.cancellation`、`EngineMetrics.cancelled_requests` 与
   `paged_engine_cancelled_requests`；全部暴露指标有 HELP/TYPE。
@@ -19,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overflow 策略、指标语义口径与测试方式；待评审后分 PR 实现（P0-001/002/003）。
 
 ### Fixed
+- 2026-10-04 CLI 批次：Poisson 测量 RNG 从 seed 重置，两个模式的测量 prompt
+  按 measured_index 选择，避免预热吞吐改变正式输入；改为绝对 deadline，预热
+  到达不越过窗口。worker JoinError 向 CLI 传播，不静默输出不完整执行的报告。
 - 2026-10-04 指标批次：JSON 拒绝、后端错误、SSE 提前关闭与慢消费者溢出纳入
   HTTP 错误计数；多个候选、handler 与 SSE 共用去重标记，未消费 SSE 的后端
   失败同样可观测。最后一步已计算成功时的文本溢出仍计 HTTP 失败，不改引擎成功事实。

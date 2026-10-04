@@ -25,6 +25,18 @@ benchmarks/serving/
 压测客户端是 [`src/bin/loadgen.rs`](../../src/bin/loadgen.rs)（闭环饱和 /
 开环泊松双模式，同一二进制零改动覆盖三个后端）。
 
+## CLI 回归验证
+
+```bash
+cargo test --locked --test loadgen_cli
+```
+
+测试启动真实 loadgen 子进程和本地 TCP/SSE 夹具服务器，联合核对 CLI 参数、warmup、
+closed/Poisson 发压、原始 JSONL 和 summary。相同 seed 的计划及测量 prompt 顺序
+不受预热次数影响；未知 token 保留 null，错误详情保留，tok/s 只在成功请求 token
+coverage 完整时输出。计划/实际 dispatch 字段的意义见 [方法论](methodology.md)。
+这组测试不需要 GPU，不是 CUDA serving 性能结果，也不验收生产服务端回收或网络压力。
+
 ## 快速开始
 
 ```bash

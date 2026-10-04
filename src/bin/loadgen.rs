@@ -126,6 +126,10 @@ struct RequestRecord {
     request_id: usize,
     /// 测量窗口内序号（warmup 请求为 null）
     measured_index: Option<usize>,
+    /// Poisson 计划到达时间，相对测量起点；closed/warmup 为 null。
+    scheduled_arrival_ms: Option<f64>,
+    /// 实际开始执行请求的时间，相对测量起点；不是服务端/网络到达时间。
+    dispatch_offset_ms: Option<f64>,
     ok: bool,
     error_class: Option<String>,
     /// 错误详情（stream_error 的服务端消息等；聚合统计仍用 error_class）
@@ -186,6 +190,8 @@ struct RunConfigSummary {
     rate: Option<f64>,
     /// 实际用于 Poisson 指数间隔的随机种子；closed 模式为 null。
     arrival_seed: Option<u64>,
+    /// 新测量窗口从 seed 重置 RNG，并使用累积绝对 deadline；closed 为 null。
+    arrival_schedule: Option<&'static str>,
     max_tokens: u32,
     warmup_secs: u64,
     timeout_secs: u64,
@@ -219,6 +225,8 @@ fn failure_record(
     RequestRecord {
         request_id,
         measured_index,
+        scheduled_arrival_ms: None,
+        dispatch_offset_ms: None,
         ok: false,
         error_class: Some(error_class.to_string()),
         error_detail,
@@ -455,6 +463,8 @@ async fn run_request(
     RequestRecord {
         request_id,
         measured_index,
+        scheduled_arrival_ms: None,
+        dispatch_offset_ms: None,
         ok,
         error_class,
         error_detail,
@@ -586,6 +596,7 @@ fn build_summary(records: &[RequestRecord], wall_secs: f64, args: &Args) -> RunS
             concurrency: (args.mode == "closed").then_some(args.concurrency),
             rate: (args.mode == "poisson").then_some(args.rate),
             arrival_seed: (args.mode == "poisson").then_some(args.seed).flatten(),
+            arrival_schedule: (args.mode == "poisson").then_some("absolute_deadline_seed_reset"),
             max_tokens: args.max_tokens,
             warmup_secs: args.warmup_secs,
             timeout_secs: args.timeout_secs,
@@ -770,10 +781,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let next_id = Arc::new(AtomicUsize::new(0));
 
     // 取下一个数据集条目（环绕）；返回 (全局请求 id, 条目)。
-    let pick = |next_id: &Arc<AtomicUsize>, dataset: &Arc<Vec<DatasetEntry>>| {
-        let id = next_id.fetch_add(1, Ordering::Relaxed);
-        (id, dataset[id % dataset.len()].clone())
-    };
+    let pick =
+        |next_id: &Arc<AtomicUsize>, dataset: &Arc<Vec<DatasetEntry>>, index: Option<usize>| {
+            let id = next_id.fetch_add(1, Ordering::Relaxed);
+            (id, dataset[index.unwrap_or(id) % dataset.len()].clone())
+        };
 
     let measured_count = Arc::new(AtomicUsize::new(0));
 
@@ -793,7 +805,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 warmup_handles.push(tokio::spawn(async move {
                     while !stop.load(Ordering::Relaxed) {
-                        let (id, entry) = pick(&next_id, &dataset);
+                        let (id, entry) = pick(&next_id, &dataset, None);
                         let rec = run_request(
                             &client,
                             &args,
@@ -812,7 +824,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_secs(args.warmup_secs)).await;
             stop.store(true, Ordering::Relaxed);
             for h in warmup_handles {
-                let _ = h.await;
+                h.await?;
             }
             println!("warmup 完成（{}s），开始测量窗口", args.warmup_secs);
         }
@@ -836,8 +848,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if idx >= args.requests {
                         break;
                     }
-                    let (id, entry) = pick(&next_id, &dataset);
-                    let rec = run_request(
+                    let (id, entry) = pick(&next_id, &dataset, Some(idx));
+                    let dispatch_offset_ms = measure_start.elapsed().as_secs_f64() * 1000.0;
+                    let mut rec = run_request(
                         &client,
                         &args,
                         id,
@@ -846,12 +859,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         output_tokenizer.as_deref(),
                     )
                     .await;
+                    rec.dispatch_offset_ms = Some(dispatch_offset_ms);
                     records.lock().unwrap().push(rec);
                 }
             }));
         }
         for h in handles {
-            let _ = h.await;
+            h.await?;
         }
         measure_start.elapsed().as_secs_f64()
     } else {
@@ -865,10 +879,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 先发射 warmup 流量（不计入 issued 上限）。
         if args.warmup_secs > 0 {
             let warmup_until = Instant::now() + Duration::from_secs(args.warmup_secs);
+            let mut arrival_at = Instant::now();
             while Instant::now() < warmup_until {
                 let dt = poisson_interval_secs(&mut rng, args.rate);
-                tokio::time::sleep(Duration::from_secs_f64(dt)).await;
-                let (id, entry) = pick(&next_id, &dataset);
+                arrival_at += Duration::from_secs_f64(dt);
+                if arrival_at >= warmup_until {
+                    tokio::time::sleep_until(warmup_until.into()).await;
+                    break;
+                }
+                tokio::time::sleep_until(arrival_at.into()).await;
+                if Instant::now() >= warmup_until {
+                    break;
+                }
+                let (id, entry) = pick(&next_id, &dataset, None);
                 let (client, args, output_tokenizer) =
                     (client.clone(), args.clone(), output_tokenizer.clone());
                 warmup_handles.push(tokio::spawn(async move {
@@ -884,17 +907,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }));
             }
             for h in warmup_handles {
-                let _ = h.await; // warmup 结果丢弃，仅起预热作用
+                h.await?; // warmup 结果丢弃，执行任务失败则退出。
             }
             println!("warmup 完成（{}s），开始测量窗口", args.warmup_secs);
         }
         let measure_start = Instant::now();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut scheduled_offset = Duration::ZERO;
 
         while issued < args.requests {
             let dt = poisson_interval_secs(&mut rng, args.rate);
-            tokio::time::sleep(Duration::from_secs_f64(dt)).await;
-            let (id, entry) = pick(&next_id, &dataset);
+            scheduled_offset += Duration::from_secs_f64(dt);
+            tokio::time::sleep_until((measure_start + scheduled_offset).into()).await;
             let idx = issued;
+            let (id, entry) = pick(&next_id, &dataset, Some(idx));
             issued += 1;
             let (client, args, records, output_tokenizer) = (
                 client.clone(),
@@ -903,7 +929,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_tokenizer.clone(),
             );
             handles.push(tokio::spawn(async move {
-                let rec = run_request(
+                let dispatch_offset_ms = measure_start.elapsed().as_secs_f64() * 1000.0;
+                let mut rec = run_request(
                     &client,
                     &args,
                     id,
@@ -912,11 +939,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     output_tokenizer.as_deref(),
                 )
                 .await;
+                rec.scheduled_arrival_ms = Some(scheduled_offset.as_secs_f64() * 1000.0);
+                rec.dispatch_offset_ms = Some(dispatch_offset_ms);
                 records.lock().unwrap().push(rec);
             }));
         }
         for h in handles {
-            let _ = h.await;
+            h.await?;
         }
         measure_start.elapsed().as_secs_f64()
     };
@@ -986,6 +1015,8 @@ mod tests {
         RequestRecord {
             request_id: 0,
             measured_index: Some(0),
+            scheduled_arrival_ms: None,
+            dispatch_offset_ms: None,
             ok: true,
             error_class: None,
             error_detail: None,
@@ -1004,6 +1035,8 @@ mod tests {
         RequestRecord {
             request_id: 0,
             measured_index: Some(0),
+            scheduled_arrival_ms: None,
+            dispatch_offset_ms: None,
             ok: false,
             error_class: Some(class.to_string()),
             error_detail: Some("detail".to_string()),
@@ -1019,8 +1052,7 @@ mod tests {
     }
 
     // ---- 真实 HTTP/SSE 回归：本地一次性 server ----
-    // 用 std::net 而非 tokio::net：本 crate 未启用 tokio "net" feature，
-    // 测试 server 只需阻塞写若干字节。
+    // 单请求夹具用 std::net 直接控制原始字节，便于制造分帧、非法 UTF-8 和断流。
 
     /// 读完一个 HTTP 请求（headers + Content-Length body）。若未消费请求体
     /// 就提前写响应并关连接，client 可能先读到 RST 而非响应。

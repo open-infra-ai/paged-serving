@@ -42,6 +42,19 @@ EOS 等特殊 token，必须在报表中标注。未提供 tokenizer 时 token �
 `run_metadata.json`。种子固定的是计划到达间隔；GPU 时钟、操作系统调度和网络抖动仍会使
 实际完成时刻存在波动，不能把它误说成完全确定性实验。
 
+测量窗口从 `arrival_seed` 重新初始化 RNG，Poisson 使用相对测量起点的累积
+绝对 deadline，而不是每次发压后再相对 sleep。预热消耗不推进测量窗口的 RNG；两个模式
+都按 `measured_index` 选测量 prompt，不能让预热请求数改变正式数据集顺序。
+deadline 落后时照常发出到期请求，不丢请求、不等待前一响应；这可能形成迟到后的集中发压，
+因此必须查看实际 dispatch，不能把目标 λ 当作已实现的服务端到达率。
+
+`per_request.jsonl` 的 `scheduled_arrival_ms` 是 Poisson 的计划时间，closed 为 null；
+`dispatch_offset_ms` 是开始执行该请求的客户端时间。两者均相对测量起点，后者包含客户端
+调度抖动，但不是服务器收到请求的时间。`summary.config.arrival_schedule` 的
+`absolute_deadline_seed_reset` 标记这一执行口径；closed 为 null。
+这些是 schema v1 的可选扩展，历史记录缺字段时按“未采集”解释，禁止回填或猜测。
+与没有该标记的历史负载比较时需重新配对实验，不将调度方式变化解释成服务端加速。
+
 闭环与开环回答不同问题：闭环给"上限"，开环给"给定到达率下的延迟代价"。
 只报闭环是 serving 评测的常见缺陷，本体系两者强制并列。
 

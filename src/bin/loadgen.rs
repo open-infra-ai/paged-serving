@@ -350,10 +350,12 @@ async fn run_request(
         let bytes = match item {
             Ok(b) => b,
             Err(e) => {
-                stream_failure = Some((
-                    "stream_error".to_string(),
-                    format!("stream read error: {e}"),
-                ));
+                let class = if e.is_timeout() {
+                    "timeout"
+                } else {
+                    "stream_error"
+                };
+                stream_failure = Some((class.to_string(), format!("stream read error: {e}")));
                 break;
             }
         };
@@ -1156,6 +1158,31 @@ mod tests {
         rec
     }
 
+    async fn run_stalled_response(response: Vec<u8>) -> RequestRecord {
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let (base_url, join) = spawn_server(move |stream| {
+            use std::io::Write;
+            stream.write_all(&response).unwrap();
+            stream.flush().unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let mut args = test_args();
+        args.base_url = base_url;
+        args.timeout_secs = 1;
+        let rec = run_request(
+            &reqwest::Client::new(),
+            &args,
+            0,
+            Some(0),
+            &test_entry(),
+            None,
+        )
+        .await;
+        release.send(()).unwrap();
+        join.join().expect("stalled test server thread");
+        rec
+    }
+
     #[tokio::test]
     async fn run_request_success_with_usage_over_real_http() {
         let rec = run_against(
@@ -1270,25 +1297,59 @@ mod tests {
 
     #[tokio::test]
     async fn run_request_classifies_timeout() {
-        let (base_url, _join) = spawn_server(|_stream| {
-            // 读完请求后保持连接不响应；客户端 1s 超时先触发。
-            // 不 join：server 线程睡完即退，与测试无共享状态。
-            std::thread::sleep(Duration::from_secs(3));
-        });
-        let mut args = test_args();
-        args.base_url = base_url;
-        args.timeout_secs = 1;
-        let rec = run_request(
-            &reqwest::Client::new(),
-            &args,
-            0,
-            Some(0),
-            &test_entry(),
-            None,
-        )
+        let rec = run_stalled_response(Vec::new()).await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("timeout"));
+        assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn run_request_classifies_timeout_after_headers_before_first_chunk() {
+        let rec = run_stalled_response(http_response("200 OK", "text/event-stream", b"")).await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("timeout"));
+        assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+        assert_eq!(rec.chunks, 0);
+        assert!(rec.ttft_ms.is_none());
+        assert!(rec.completion_tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_request_body_timeout_preserves_partial_output_without_success_metrics() {
+        let rec = run_stalled_response(sse_response(&[
+            r#"{"choices":[{"text":"A","finish_reason":null}]}"#,
+            r#"{"choices":[{"text":"B","finish_reason":"length"}],"usage":{"completion_tokens":7}}"#,
+        ]))
         .await;
         assert!(!rec.ok);
         assert_eq!(rec.error_class.as_deref(), Some("timeout"));
+        assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+        assert_eq!(rec.chunks, 2);
+        assert!(rec.ttft_ms.is_some());
+        assert_eq!(rec.inter_chunk_latency_ms.len(), 1);
+        assert_eq!(rec.completion_tokens, Some(7));
+        assert_eq!(rec.tokens_source.as_deref(), Some("usage"));
+        assert_eq!(rec.finish_reason.as_deref(), Some("length"));
+        let summary = build_summary(&[rec], 2.0, &test_args());
+        assert_eq!(summary.requests.success, 0);
+        assert_eq!(summary.requests.failed, 1);
+        assert_eq!(summary.errors.get("timeout"), Some(&1));
+        assert_eq!(summary.ttft_ms.samples, 0);
+        assert_eq!(summary.inter_chunk_latency_ms.samples, 0);
+        assert_eq!(summary.tpot_ms.samples, 0);
+        assert_eq!(summary.completion_tokens.total, 0);
+        assert!(summary.throughput.output_tokens_per_second.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_request_truncated_body_is_stream_error_not_timeout() {
+        let rec = run_against(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"text\":\"x\",\"finish_reason\":null}]}\n\n".to_vec(),
+            test_args(),
+        )
+        .await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("stream_error"));
         assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
     }
 
@@ -1317,19 +1378,21 @@ mod tests {
 
     #[tokio::test]
     async fn run_request_classifies_error_frame_as_stream_error() {
-        let rec = run_against(
-            sse_response(&[
-                "{\"choices\":[{\"text\":\"x\",\"finish_reason\":null}]}",
-                "{\"error\":{\"message\":\"engine overloaded\"}}",
-                "[DONE]",
-            ]),
-            test_args(),
-        )
-        .await;
-        assert!(!rec.ok);
-        assert_eq!(rec.error_class.as_deref(), Some("stream_error"));
-        // 服务端错误消息透传为 detail（样例 record 保留非空 detail）。
-        assert_eq!(rec.error_detail.as_deref(), Some("engine overloaded"));
+        for message in ["engine overloaded", "backend timeout"] {
+            let error = serde_json::json!({"error": {"message": message}}).to_string();
+            let rec = run_against(
+                sse_response(&[
+                    "{\"choices\":[{\"text\":\"x\",\"finish_reason\":null}]}",
+                    &error,
+                    "[DONE]",
+                ]),
+                test_args(),
+            )
+            .await;
+            assert!(!rec.ok);
+            assert_eq!(rec.error_class.as_deref(), Some("stream_error"));
+            assert_eq!(rec.error_detail.as_deref(), Some(message));
+        }
     }
 
     #[tokio::test]

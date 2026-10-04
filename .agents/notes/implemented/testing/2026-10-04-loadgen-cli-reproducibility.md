@@ -12,6 +12,12 @@ Poisson 测量窗口重新从 arrival seed 初始化 RNG，使用测量起点的
 
 per_request 携带 nullable scheduled_arrival_ms 和 dispatch_offset_ms；summary.config 的 arrival_schedule 使用 `absolute_deadline_seed_reset` 标记。计划时间用于核对同二进制/锁文件下的 seed，实际时间保留调度抖动，不把二者混成服务器收到请求的时间。旧结果包不改写，新增字段属于 schema v1 的可选扩展；没有字段表示未采集，而不是零。
 
+CLI 的正文超时回归让六个请求收到两帧文本、usage 与 finish_reason 后等待总预算
+到期；原始记录保留部分输出并记为 timeout，summary 为 0 success、6 failed，成功
+延迟样本与 token total 为零，tok/s 为 null。CLI 退出 0 只表示完整采集这些负结果，
+不表示请求成功。超时分类的唯一决定与夹具时序见
+[真实 HTTP/SSE 分类](2026-09-15-real-http-sse-regression.md)。
+
 ## Alternatives considered
 
 提取公开 loadgen 模块能直接控制时间、运行状态并写细粒度测试，但不能证明 CLI 参数到落盘的真实连接，也扩大 API 面。测试启动 cargo 构建的真实二进制和临时本地服务器，不新增公共模块。
@@ -25,6 +31,11 @@ per_request 携带 nullable scheduled_arrival_ms 和 dispatch_offset_ms；summar
 `tests/loadgen_cli.rs` 启动 cargo 构建的真实 loadgen 子进程与本地 TCP/SSE 夹具，校验 closed/Poisson 的 6 条测量记录、序号/输入顺序、错误详情和 summary。预热请求实际被接收但没有进入文件；两次相同 seed、有/无预热的计划完全一致，不同 seed 的计划不同，实际 dispatch 不早于计划。50% 成功请求 token coverage 时 tok/s 为 null；100% coverage 时按 measurement wall 计算，支持自定义 summary 路径。非法参数非零退出且不创建结果。
 
 Rust 1.88 locked all-target check 和完整测试通过：264 个默认测试与 17 个 doc tests。4 个 CLI 用例重复 10 轮通过，共 40 次用例执行、60 个子进程；测试子进程有 10 秒超时与 kill/wait 回收，本地 TCP server 和独占临时目录由测试释放。stable clippy 无警告，fmt 与 notes 使用仓内门禁。没有真实 GPU 负载或性能结论。
+
+正文超时落盘回归纳入后的 5 个 CLI 用例连续执行 10 轮通过，共 50 次用例执行、
+70 个真实子进程；其中新增用例每次采集六条部分输出后的 timeout，成功样本为零。
+当前完整默认套件实际为 267 个测试加 17 个 doc tests，真实 tokenizer 为 1 个明确
+ignored；历史首次验收数量保留，不改写或当作本轮 GPU 门禁。
 
 ## Consequences
 

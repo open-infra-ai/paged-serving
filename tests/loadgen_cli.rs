@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -91,6 +92,19 @@ async fn respond(State(received): State<Arc<AtomicUsize>>, Json(body): Json<Valu
         "error" => vec![r#"{"error":{"message":"injected backend failure"}}"#, done],
         "no_done" => vec![chunk],
         "invalid" => vec!["{"],
+        "timeout" => {
+            let partial = format!(
+                "data: {chunk}\n\ndata: {{\"choices\":[{{\"text\":\"B\",\"finish_reason\":\"length\"}}],\"usage\":{{\"completion_tokens\":2}}}}\n\n"
+            );
+            let stream =
+                futures_util::stream::once(async { Ok::<_, std::convert::Infallible>(partial) })
+                    .chain(futures_util::stream::pending());
+            return (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response();
+        }
         prompt => panic!("unexpected test prompt: {prompt}"),
     };
     let body = events
@@ -345,5 +359,48 @@ async fn complete_usage_cli_reports_wall_time_throughput_and_custom_summary() {
     assert!(wall > 0.0);
     assert!((throughput - 12.0 / wall).abs() < 1e-8 * throughput);
     assert!(!output.0.join("nested/summary.json").exists());
+    assert_eq!(server.received.load(Ordering::Relaxed), 6);
+}
+
+#[tokio::test]
+async fn body_timeouts_cli_preserves_raw_output_and_excludes_failed_metrics() {
+    let server = TestServer::start().await;
+    let output = TestOutput::new();
+    std::fs::write(
+        output.0.join("dataset.jsonl"),
+        r#"{"prompt":"timeout","prompt_tokens":4}"#,
+    )
+    .unwrap();
+    let (records, summary) = run_cli(&server, &output, "closed", 0, 42).await;
+    assert_eq!(records.len(), 6);
+    for (index, record) in records.iter().enumerate() {
+        assert_eq!(record["measured_index"], index);
+        assert_eq!(record["ok"], false);
+        assert_eq!(record["error_class"], "timeout");
+        assert!(!record["error_detail"].as_str().unwrap().is_empty());
+        assert_eq!(record["chunks"], 2);
+        assert!(record["ttft_ms"].as_f64().is_some());
+        assert_eq!(
+            record["inter_chunk_latency_ms"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(record["completion_tokens"], 2);
+        assert_eq!(record["tokens_source"], "usage");
+        assert_eq!(record["finish_reason"], "length");
+    }
+    assert_eq!(summary["requests"]["total"], 6);
+    assert_eq!(summary["requests"]["success"], 0);
+    assert_eq!(summary["requests"]["failed"], 6);
+    assert_eq!(summary["errors"], json!({"timeout": 6}));
+    for metric in ["ttft_ms", "inter_chunk_latency_ms", "tpot_ms"] {
+        assert_eq!(summary[metric]["samples"], 0);
+        assert!(summary[metric]["p50"].is_null());
+        assert!(summary[metric]["p95"].is_null());
+        assert!(summary[metric]["p99"].is_null());
+    }
+    assert_eq!(summary["completion_tokens"]["known_requests"], 0);
+    assert_eq!(summary["completion_tokens"]["total"], 0);
+    assert_eq!(summary["throughput"]["successful_requests_per_second"], 0.0);
+    assert!(summary["throughput"]["output_tokens_per_second"].is_null());
     assert_eq!(server.received.load(Ordering::Relaxed), 6);
 }

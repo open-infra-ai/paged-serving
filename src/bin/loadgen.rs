@@ -1,8 +1,8 @@
 //! Serving 压测客户端（loadgen）：对 OpenAI 兼容 `/v1/completions`（SSE 流式）
 //! 端点做可复现负载实验。
 //!
-//! 同一二进制零改动覆盖三个后端：paged-serving / llama-server / vLLM，
-//! 保证横向可比（口径定义见 `benchmarks/serving/methodology.md`）。
+//! 面向 paged-serving / llama-server / vLLM 使用统一采集口径；各后端仍须
+//! 协议 canary 与等价工作量验证（见 `benchmarks/serving/methodology.md`）。
 //!
 //! # 负载模型
 //! - `--mode closed`：闭环饱和——固定 `--concurrency` 个并发槽，一个请求完成
@@ -119,6 +119,39 @@ struct DatasetEntry {
     /// 离线 tokenize 的 prompt token 数（元数据，仅用于报表核对）
     #[serde(default)]
     prompt_tokens: Option<u32>,
+}
+
+// flatten 保留 JSON 对象表示并忽略 provider 扩展；不接受 struct 的数组表示。
+#[derive(Deserialize)]
+struct CompletionFrame {
+    choices: Option<Vec<CompletionChoice>>,
+    usage: Option<CompletionUsage>,
+    error: Option<CompletionStreamError>,
+    #[serde(flatten)]
+    _extensions: serde::de::IgnoredAny,
+}
+
+#[derive(Deserialize)]
+struct CompletionChoice {
+    text: String,
+    finish_reason: Option<String>,
+    index: Option<u32>,
+    #[serde(flatten)]
+    _extensions: serde::de::IgnoredAny,
+}
+
+#[derive(Deserialize)]
+struct CompletionUsage {
+    completion_tokens: u32,
+    #[serde(flatten)]
+    _extensions: serde::de::IgnoredAny,
+}
+
+#[derive(Deserialize)]
+struct CompletionStreamError {
+    message: String,
+    #[serde(flatten)]
+    _extensions: serde::de::IgnoredAny,
 }
 
 #[derive(Serialize, Clone)]
@@ -345,6 +378,7 @@ async fn run_request(
     let mut finish_reason: Option<String> = None;
     let mut stream_failure: Option<(String, String)> = None;
     let mut saw_done = false;
+    let mut saw_completion = false;
 
     'outer: while let Some(item) = stream.next().await {
         let bytes = match item {
@@ -381,49 +415,59 @@ async fn run_request(
                 saw_done = true;
                 break 'outer;
             }
-            let v = match serde_json::from_str::<serde_json::Value>(&payload) {
+            let frame = match serde_json::from_str::<CompletionFrame>(&payload) {
                 Ok(value) => value,
                 Err(e) => {
                     stream_failure = Some((
                         "protocol_error".to_string(),
-                        format!("invalid JSON in SSE data: {e}"),
+                        format!("invalid completions SSE data: {e}"),
                     ));
                     break 'outer;
                 }
             };
-            if let Some(err) = v.get("error") {
+            if let Some(err) = frame.error {
+                stream_failure = Some(if err.message.is_empty() {
+                    (
+                        "protocol_error".to_string(),
+                        "empty message in SSE error".to_string(),
+                    )
+                } else {
+                    ("stream_error".to_string(), err.message)
+                });
+                break 'outer;
+            }
+            if frame.choices.is_none() && frame.usage.is_none() {
                 stream_failure = Some((
-                    "stream_error".to_string(),
-                    err.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown stream error")
-                        .to_string(),
+                    "protocol_error".to_string(),
+                    "SSE data contains neither choices nor usage".to_string(),
                 ));
                 break 'outer;
             }
-            // 最终帧：usage / finish_reason（text 通常为空）
-            if let Some(usage) = v.get("usage") {
-                if let Some(ct) = usage
-                    .get("completion_tokens")
-                    .and_then(|c| c.as_u64())
-                    .and_then(|ct| u32::try_from(ct).ok())
-                {
-                    completion_tokens = Some(ct);
-                }
+            let choices = frame.choices.unwrap_or_default();
+            if choices.len() > 1
+                || choices
+                    .first()
+                    .is_some_and(|c| c.index.is_some_and(|i| i != 0))
+            {
+                stream_failure = Some((
+                    "protocol_error".to_string(),
+                    "expected a single completion candidate with index 0".to_string(),
+                ));
+                break 'outer;
             }
-            if let Some(choice) = v.get("choices").and_then(|c| c.get(0)) {
-                if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+            saw_completion |= !choices.is_empty() || frame.usage.is_some();
+            if let Some(usage) = frame.usage {
+                completion_tokens = Some(usage.completion_tokens);
+            }
+            if let Some(choice) = choices.into_iter().next() {
+                if let Some(fr) = choice.finish_reason {
                     if !fr.is_empty() {
-                        finish_reason = Some(fr.to_string());
+                        finish_reason = Some(fr);
                     }
                 }
-                let text = choice
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or_default();
-                if !text.is_empty() {
+                if !choice.text.is_empty() {
                     chunk_times.push(Instant::now());
-                    output_text.push_str(text);
+                    output_text.push_str(&choice.text);
                 }
             }
         }
@@ -432,7 +476,7 @@ async fn run_request(
     let duration_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
     // 失败归类：流内 error > 无 [DONE]（即使已收到部分 chunk 也判失败，
-    // 成功率口径不掺水）> 正常
+    // 成功率口径不掺水）> 空 completion > 正常
     let (ok, error_class, error_detail) = if let Some((class, message)) = &stream_failure {
         (false, Some(class.clone()), Some(message.clone()))
     } else if !saw_done {
@@ -440,6 +484,12 @@ async fn run_request(
             false,
             Some("no_done".to_string()),
             Some("SSE stream ended without [DONE]".to_string()),
+        )
+    } else if !saw_completion {
+        (
+            false,
+            Some("protocol_error".to_string()),
+            Some("SSE stream has [DONE] but no completion choice or usage".to_string()),
         )
     } else {
         (true, None, None)
@@ -1139,6 +1189,14 @@ mod tests {
 
     /// 对一次性 server 执行一次真实 run_request，返回聚合后的 record。
     async fn run_against(response: Vec<u8>, mut args: Args) -> RequestRecord {
+        run_against_with_tokenizer(response, &mut args, None).await
+    }
+
+    async fn run_against_with_tokenizer(
+        response: Vec<u8>,
+        args: &mut Args,
+        tokenizer: Option<&Tokenizer>,
+    ) -> RequestRecord {
         let (base_url, join) = spawn_server(move |stream| {
             use std::io::Write;
             let _ = stream.write_all(&response);
@@ -1147,11 +1205,11 @@ mod tests {
         args.base_url = base_url;
         let rec = run_request(
             &reqwest::Client::new(),
-            &args,
+            args,
             0,
             Some(0),
             &test_entry(),
-            None,
+            tokenizer,
         )
         .await;
         join.join().expect("test server thread");
@@ -1359,6 +1417,201 @@ mod tests {
         assert!(!rec.ok);
         assert_eq!(rec.error_class.as_deref(), Some("protocol_error"));
         assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn run_request_rejects_malformed_completion_frames() {
+        for payload in [
+            r#"{}"#,
+            r#"[]"#,
+            r#"null"#,
+            r#"42"#,
+            r#""completion""#,
+            r#"[[{"text":"A"}],null,null]"#,
+            r#"{"choices":"A"}"#,
+            r#"{"choices":[null]}"#,
+            r#"{"choices":[{}]}"#,
+            r#"{"choices":[{"text":42}]}"#,
+            r#"{"choices":[{"text":null}]}"#,
+            r#"{"choices":[{"text":"A","finish_reason":42}]}"#,
+            r#"{"choices":[{"text":"A","index":1}]}"#,
+            r#"{"choices":[{"text":"A","index":-1}]}"#,
+            r#"{"choices":[{"text":"A"},{"text":"B"}]}"#,
+            r#"{"choices":[["A",null,0]]}"#,
+        ] {
+            let rec = run_against(sse_response(&[payload, "[DONE]"]), test_args()).await;
+            assert!(!rec.ok, "malformed frame accepted: {payload}");
+            assert_eq!(
+                rec.error_class.as_deref(),
+                Some("protocol_error"),
+                "{payload}"
+            );
+            assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+            assert_eq!(rec.chunks, 0, "invalid frame must not contribute text");
+            assert!(rec.completion_tokens.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_rejects_invalid_usage_after_partial_output() {
+        for usage in [
+            r#"{"completion_tokens":-1}"#,
+            r#"{"completion_tokens":1.5}"#,
+            r#"{"completion_tokens":"3"}"#,
+            r#"{"completion_tokens":4294967296}"#,
+            r#"{"completion_tokens":null}"#,
+            r#"{}"#,
+            r#"[3]"#,
+            r#""usage""#,
+        ] {
+            let invalid = format!(r#"{{"choices":[{{"text":"B"}}],"usage":{usage}}}"#);
+            let rec = run_against(
+                sse_response(&[r#"{"choices":[{"text":"A"}]}"#, &invalid, "[DONE]"]),
+                test_args(),
+            )
+            .await;
+            assert!(!rec.ok, "invalid usage accepted: {usage}");
+            assert_eq!(rec.error_class.as_deref(), Some("protocol_error"));
+            assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+            assert_eq!(rec.chunks, 1, "retain only the preceding valid frame");
+            assert!(rec.ttft_ms.is_some());
+            assert!(rec.completion_tokens.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_invalid_usage_is_not_hidden_by_tokenizer_fallback() {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(
+                [("[UNK]".to_string(), 0), ("A".to_string(), 1)]
+                    .into_iter()
+                    .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let tokenizer = Tokenizer::new(model);
+        let rec = run_against_with_tokenizer(
+            sse_response(&[
+                r#"{"choices":[{"text":"A"}]}"#,
+                r#"{"usage":{"completion_tokens":-1}}"#,
+                "[DONE]",
+            ]),
+            &mut test_args(),
+            Some(&tokenizer),
+        )
+        .await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("protocol_error"));
+        assert_eq!(rec.chunks, 1);
+        assert_eq!(rec.completion_tokens, Some(1));
+        assert_eq!(rec.tokens_source.as_deref(), Some("tokenizer_text"));
+        let summary = build_summary(&[rec], 1.0, &test_args());
+        assert_eq!(summary.requests.success, 0);
+        assert_eq!(summary.errors.get("protocol_error"), Some(&1));
+        assert_eq!(summary.ttft_ms.samples, 0);
+        assert_eq!(summary.completion_tokens.total, 0);
+        assert_eq!(summary.completion_tokens.known_requests, 0);
+        assert!(summary.throughput.output_tokens_per_second.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_request_rejects_duplicate_completion_fields() {
+        for payload in [
+            r#"{"choices":[],"choices":[{"text":"A"}]}"#,
+            r#"{"choices":null,"choices":[{"text":"A"}]}"#,
+            r#"{"usage":null,"usage":{"completion_tokens":3}}"#,
+            r#"{"choices":[{"text":"A","text":"B"}]}"#,
+            r#"{"choices":[{"text":"A","finish_reason":null,"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"text":"A","index":0,"index":0}]}"#,
+            r#"{"usage":{"completion_tokens":3,"completion_tokens":3}}"#,
+            r#"{"usage":{"completion_tokens":3,"completion_\u0074okens":4}}"#,
+            r#"{"error":null,"error":{"message":"backend failure"}}"#,
+            r#"{"error":{"message":"first","message":"second"}}"#,
+        ] {
+            let rec = run_against(sse_response(&[payload, "[DONE]"]), test_args()).await;
+            assert!(!rec.ok, "duplicate field accepted: {payload}");
+            assert_eq!(
+                rec.error_class.as_deref(),
+                Some("protocol_error"),
+                "{payload}"
+            );
+            assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+            assert_eq!(rec.chunks, 0);
+            assert!(rec.completion_tokens.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_requires_completion_before_done() {
+        for events in [vec!["[DONE]"], vec![r#"{"choices":[]}"#, "[DONE]"]] {
+            let rec = run_against(sse_response(&events), test_args()).await;
+            assert!(!rec.ok, "DONE alone is not a completion");
+            assert_eq!(rec.error_class.as_deref(), Some("protocol_error"));
+            assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+            assert_eq!(rec.chunks, 0);
+            assert!(rec.ttft_ms.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_accepts_usage_only_and_zero_tokens() {
+        for payload in [
+            r#"{"choices":[],"usage":{"completion_tokens":0}}"#,
+            r#"{"usage":{"completion_tokens":0}}"#,
+            r#"{"choices":[{"text":"","index":0,"finish_reason":"stop"}],"usage":{"completion_tokens":0}}"#,
+        ] {
+            let rec = run_against(sse_response(&[payload, "[DONE]"]), test_args()).await;
+            assert!(rec.ok, "valid zero output rejected: {payload}");
+            assert_eq!(rec.completion_tokens, Some(0));
+            assert_eq!(rec.tokens_source.as_deref(), Some("usage"));
+            assert_eq!(rec.chunks, 0);
+            assert!(rec.ttft_ms.is_none());
+            let summary = build_summary(&[rec], 1.0, &test_args());
+            assert_eq!(summary.requests.success, 1);
+            assert_eq!(summary.completion_tokens.coverage_pct, 100.0);
+            assert_eq!(summary.throughput.output_tokens_per_second, Some(0.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_accepts_extensions_and_empty_completion() {
+        for text in ["A", ""] {
+            let payload = serde_json::json!({
+                "id":"provider-id", "object":"text_completion", "metadata":{"custom":true},
+                "choices":[{"text":text, "index":0, "finish_reason":"stop", "logprobs":null}],
+                "usage":null,
+            })
+            .to_string();
+            let rec = run_against(
+                sse_response(&[r#"{"choices":[]}"#, &payload, "[DONE]"]),
+                test_args(),
+            )
+            .await;
+            assert!(rec.ok, "valid extension/empty text rejected: {text}");
+            assert_eq!(rec.chunks, u32::from(!text.is_empty()));
+            assert_eq!(rec.finish_reason.as_deref(), Some("stop"));
+            assert!(rec.completion_tokens.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_rejects_malformed_error_frames() {
+        for payload in [
+            r#"{"error":{}}"#,
+            r#"{"error":{"message":42}}"#,
+            r#"{"error":{"message":""}}"#,
+            r#"{"error":["backend failure"]}"#,
+        ] {
+            let rec = run_against(sse_response(&[payload, "[DONE]"]), test_args()).await;
+            assert!(!rec.ok);
+            assert_eq!(
+                rec.error_class.as_deref(),
+                Some("protocol_error"),
+                "{payload}"
+            );
+            assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+        }
     }
 
     #[tokio::test]

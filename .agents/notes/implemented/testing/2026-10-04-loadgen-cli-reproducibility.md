@@ -18,6 +18,11 @@ CLI 的正文超时回归让六个请求收到两帧文本、usage 与 finish_re
 不表示请求成功。超时分类的唯一决定与夹具时序见
 [真实 HTTP/SSE 分类](2026-09-15-real-http-sse-regression.md)。
 
+异常 completion 的 CLI 回归采集无意义 JSON、非法 usage 与仅 DONE 三种响应，
+各两次；六条 raw 都保留 protocol_error 和非空详情，非法 usage 前的合法文本仍有
+chunk/TTFT，但 summary 的成功请求、延迟样本与 token total 为零，tok/s 为 null。
+退出 0 仍是完整采集负结果。帧合法性的唯一决定见上述分类笔记，不扩展落盘 schema。
+
 ## Alternatives considered
 
 提取公开 loadgen 模块能直接控制时间、运行状态并写细粒度测试，但不能证明 CLI 参数到落盘的真实连接，也扩大 API 面。测试启动 cargo 构建的真实二进制和临时本地服务器，不新增公共模块。
@@ -34,8 +39,14 @@ Rust 1.88 locked all-target check 和完整测试通过：264 个默认测试与
 
 正文超时落盘回归纳入后的 5 个 CLI 用例连续执行 10 轮通过，共 50 次用例执行、
 70 个真实子进程；其中新增用例每次采集六条部分输出后的 timeout，成功样本为零。
-当前完整默认套件实际为 267 个测试加 17 个 doc tests，真实 tokenizer 为 1 个明确
+该批完整默认套件实际为 267 个测试加 17 个 doc tests，真实 tokenizer 为 1 个明确
 ignored；历史首次验收数量保留，不改写或当作本轮 GPU 门禁。
+
+异常 completion 用例在修复前因 raw 的 ok=true 失败，cargo 退出 101；修复后 6 个 CLI
+用例连续执行 10 轮通过，共 60 次用例执行、80 个真实子进程。29 个 loadgen 测试也
+通过这 10 轮；完整默认套件实际 276 个测试加 17 个 doc tests，真实 tokenizer 仍是
+1 个明确 ignored。合法空输出、usage-only、扩展字段与 tokenizer fallback 的单请求
+正反例由分类笔记维护；不把这个 TCP 夹具称为真实 GPU 回收或多引擎运行证据。
 
 ## Consequences
 

@@ -92,6 +92,9 @@ async fn respond(State(received): State<Arc<AtomicUsize>>, Json(body): Json<Valu
         "error" => vec![r#"{"error":{"message":"injected backend failure"}}"#, done],
         "no_done" => vec![chunk],
         "invalid" => vec!["{"],
+        "invalid_shape" => vec!["{}", done],
+        "invalid_usage" => vec![chunk, r#"{"usage":{"completion_tokens":-1}}"#, done],
+        "done_only" => vec![done],
         "timeout" => {
             let partial = format!(
                 "data: {chunk}\n\ndata: {{\"choices\":[{{\"text\":\"B\",\"finish_reason\":\"length\"}}],\"usage\":{{\"completion_tokens\":2}}}}\n\n"
@@ -392,6 +395,46 @@ async fn body_timeouts_cli_preserves_raw_output_and_excludes_failed_metrics() {
     assert_eq!(summary["requests"]["success"], 0);
     assert_eq!(summary["requests"]["failed"], 6);
     assert_eq!(summary["errors"], json!({"timeout": 6}));
+    for metric in ["ttft_ms", "inter_chunk_latency_ms", "tpot_ms"] {
+        assert_eq!(summary[metric]["samples"], 0);
+        assert!(summary[metric]["p50"].is_null());
+        assert!(summary[metric]["p95"].is_null());
+        assert!(summary[metric]["p99"].is_null());
+    }
+    assert_eq!(summary["completion_tokens"]["known_requests"], 0);
+    assert_eq!(summary["completion_tokens"]["total"], 0);
+    assert_eq!(summary["throughput"]["successful_requests_per_second"], 0.0);
+    assert!(summary["throughput"]["output_tokens_per_second"].is_null());
+    assert_eq!(server.received.load(Ordering::Relaxed), 6);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_completion_cli_records_failures_without_success_metrics() {
+    let server = TestServer::start().await;
+    let output = TestOutput::new();
+    let dataset = ["invalid_shape", "invalid_usage", "done_only"]
+        .iter()
+        .map(|prompt| json!({"prompt":prompt, "prompt_tokens":4}).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(output.0.join("dataset.jsonl"), dataset).unwrap();
+    let (records, summary) = run_cli(&server, &output, "closed", 0, 42).await;
+    assert_eq!(records.len(), 6);
+    for (index, record) in records.iter().enumerate() {
+        assert_eq!(record["measured_index"], index);
+        assert_eq!(record["ok"], false);
+        assert_eq!(record["error_class"], "protocol_error");
+        assert!(!record["error_detail"].as_str().unwrap().is_empty());
+        let has_partial_output = index % 3 == 1;
+        assert_eq!(record["chunks"], usize::from(has_partial_output));
+        assert_eq!(record["ttft_ms"].is_number(), has_partial_output);
+        assert!(record["completion_tokens"].is_null());
+        assert!(record["tokens_source"].is_null());
+    }
+    assert_eq!(summary["requests"]["total"], 6);
+    assert_eq!(summary["requests"]["success"], 0);
+    assert_eq!(summary["requests"]["failed"], 6);
+    assert_eq!(summary["errors"], json!({"protocol_error":6}));
     for metric in ["ttft_ms", "inter_chunk_latency_ms", "tpot_ms"] {
         assert_eq!(summary[metric]["samples"], 0);
         assert!(summary[metric]["p50"].is_null());

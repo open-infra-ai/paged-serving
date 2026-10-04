@@ -87,9 +87,26 @@ def reject_constant(value):
     raise ValueError(f"JSON 禁止非有限常量 {value}")
 
 
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 对象含重复键 {key!r}")
+        result[key] = value
+    return result
+
+
+def finite_float(literal):
+    value = float(literal)
+    if not math.isfinite(value):
+        raise ValueError(f"JSON 数值超出有限浮点范围: {literal}")
+    return value
+
+
 def decode_json(content, location):
     try:
-        value = json.loads(content, parse_constant=reject_constant)
+        value = json.loads(content, parse_constant=reject_constant,
+                           object_pairs_hook=unique_object, parse_float=finite_float)
     except ValueError as error:
         raise EvidenceError("invalid_json", location, str(error)) from error
     return mapping(value, location)

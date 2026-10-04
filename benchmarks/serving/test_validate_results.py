@@ -251,6 +251,70 @@ class ResultSemanticsTests(unittest.TestCase):
         (path / "summary.json").unlink()
         self.assert_rejected("missing_file")
 
+    def test_duplicate_keys_are_rejected_at_every_depth(self):
+        for content in ('{"key": 1, "key": 1}', '{"outer": {"key": 1, "key": 2}}',
+                        '{"outer": [{"key": 1, "key": 2}]}', r'{"key": 1, "\u006bey": 2}'):
+            with self.subTest(content=content):
+                with self.assertRaises(validator.EvidenceError) as caught:
+                    validator.decode_json(content, "fixture.json")
+                self.assertEqual(caught.exception.issue["code"], "invalid_json")
+                self.assertIn("key", caught.exception.issue["message"])
+
+    def test_duplicate_keys_are_rejected_in_all_evidence_files(self):
+        run, _, _, _ = self.add_run()
+        for path, key, conflicting in ((self.root / "metadata.json", "schema_version", "2"),
+                                       (run / "summary.json", "schema_version", "2"),
+                                       (run / "run_metadata.json", "schema_version", "2"),
+                                       (run / "per_request.jsonl", "ok", "false")):
+            with self.subTest(path=path.name):
+                original = path.read_text(encoding="utf-8")
+                path.write_text(original.replace("{", f'{{"{key}": {conflicting}, ', 1), encoding="utf-8")
+                try:
+                    self.assert_rejected("invalid_json")
+                    issue = next(i for i in self.audit()["errors"] if i["code"] == "invalid_json")
+                    self.assertIn(str(path), issue["location"])
+                    self.assertIn(key, issue["message"])
+                    if path.suffix == ".jsonl":
+                        self.assertTrue(issue["location"].endswith(":1"))
+                finally:
+                    path.write_text(original, encoding="utf-8")
+
+    def test_overflowing_literals_are_rejected_even_in_uninterpreted_fields(self):
+        run, _, _, _ = self.add_run()
+        for path in (self.root / "metadata.json", run / "summary.json",
+                     run / "run_metadata.json", run / "per_request.jsonl"):
+            original = path.read_text(encoding="utf-8")
+            for literal in ("1e400", "-1e400"):
+                with self.subTest(path=path.name, literal=literal):
+                    path.write_text(original.replace("{", f'{{"extra": {{"values": [{literal}]}}, ', 1),
+                                    encoding="utf-8")
+                    try:
+                        self.assert_rejected("invalid_json")
+                    finally:
+                        path.write_text(original, encoding="utf-8")
+        self.assertEqual(validator.decode_json('{"extra": 1e308}', "fixture.json"), {"extra": 1e308})
+
+    def test_ambiguous_json_cli_refuses_audit_and_plot_without_writes(self):
+        run, _, _, _ = self.add_run()
+        path = run / "summary.json"
+        original = path.read_text(encoding="utf-8")
+        path.write_text(original.replace("{", '{"schema_version": 2, ', 1), encoding="utf-8")
+        before = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        result = subprocess.run([sys.executable, str(HERE / "validate_results.py"), "--json", str(self.root)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("invalid_json", [i["code"] for i in report["errors"]])
+        self.assertNotIn("Traceback", result.stderr)
+        output = self.root / "not-created"
+        result = subprocess.run([sys.executable, str(HERE / "plots.py"), str(self.root), "--out-dir", str(output)],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("invalid_json", result.stderr)
+        self.assertFalse(output.exists())
+        self.assertEqual(before, {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()})
+
     def test_unreadable_utf8_is_diagnostic(self):
         path, _, _, _ = self.add_run()
         (path / "per_request.jsonl").write_bytes(b"\xff\xfe")

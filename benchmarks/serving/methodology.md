@@ -42,6 +42,19 @@ EOS 等特殊 token，必须在报表中标注。未提供 tokenizer 时 token �
 `run_metadata.json`。种子固定的是计划到达间隔；GPU 时钟、操作系统调度和网络抖动仍会使
 实际完成时刻存在波动，不能把它误说成完全确定性实验。
 
+测量窗口从 `arrival_seed` 重新初始化 RNG，Poisson 使用相对测量起点的累积
+绝对 deadline，而不是每次发压后再相对 sleep。预热消耗不推进测量窗口的 RNG；两个模式
+都按 `measured_index` 选测量 prompt，不能让预热请求数改变正式数据集顺序。
+deadline 落后时照常发出到期请求，不丢请求、不等待前一响应；这可能形成迟到后的集中发压，
+因此必须查看实际 dispatch，不能把目标 λ 当作已实现的服务端到达率。
+
+`per_request.jsonl` 的 `scheduled_arrival_ms` 是 Poisson 的计划时间，closed 为 null；
+`dispatch_offset_ms` 是开始执行该请求的客户端时间。两者均相对测量起点，后者包含客户端
+调度抖动，但不是服务器收到请求的时间。`summary.config.arrival_schedule` 的
+`absolute_deadline_seed_reset` 标记这一执行口径；closed 为 null。
+这些是 schema v1 的可选扩展，历史记录缺字段时按“未采集”解释，禁止回填或猜测。
+与没有该标记的历史负载比较时需重新配对实验，不将调度方式变化解释成服务端加速。
+
 闭环与开环回答不同问题：闭环给"上限"，开环给"给定到达率下的延迟代价"。
 只报闭环是 serving 评测的常见缺陷，本体系两者强制并列。
 
@@ -67,7 +80,7 @@ EOS 等特殊 token，必须在报表中标注。未提供 tokenizer 时 token �
    metadata 记录 `dirty: true`）。
 2. **预热**：`--warmup-secs ≥ 30`（warmup 流量与测量窗口同负载形态，结果丢弃）。
 3. **重复与收敛**：每个 (并发, 分布) 组合跑 3 次，报告均值与 min/max 波动；
-   run-to-run 偏差 >10% 视为未收敛，须排查（笔记本卡散热降频是常见原因，
+   按 `(max − min) / mean > 10%` 视为未收敛，须排查（笔记本卡散热降频是常见原因，
    写入结果说明而非隐藏）。
 4. **横向可比**：三个后端（paged-serving / llama-server / vLLM）使用
    同一 `loadgen` 二进制、同一数据集、同一参数矩阵；量化格式差异
@@ -115,8 +128,28 @@ results/<date>-<gpu-slug>/
 再进入正式对照。
 
 运行 `python3 validate_results.py <result-root>` 检查基础产物；发布前运行
-`python3 validate_results.py --formal <result-root>`。后者额外要求 `report.md`、汇总 CSV、
-图表和每个 run 的模型 SHA-256，但仍不判断数值是否“好看”。
+`python3 validate_results.py --formal <result-root>`。两种模式均联合重算 JSONL 与 summary，
+检查完整测量序号、唯一 request_id、成功/失败与错误分类、token 来源与 coverage、
+样本数和分位、成功请求数/输出 token 总量除以 `measurement_wall_secs` 的吞吐。
+失败流可携带部分文本与 token，但不进入成功性能样本或成功 token 总量。
+分位选取与 loadgen 一致：排序后取 `round(p/100 × (n−1))`，非负索引的 0.5 向上舍入；
+浮点指标重算容差为 `rel_tol=1e-9`、`abs_tol=1e-6`，整数计数和配置参数必须完全一致。
+
+目录标签、run metadata 和 summary.config 必须一致；同一引擎/模式/数据集的曲线只允许
+并发或 rate 改变，模型文件/量化、commit/dirty、数据集路径、请求数、预热、超时、
+tokenizer 和到达执行口径保持一致。Poisson 的 seed 可随重复变化，但各 run 的声明要一致。
+旧 Poisson seed、计划/dispatch 字段未采集时诊断为 `legacy_*_unavailable`；不回填，
+不能据此声称计划负载可复现。带新到达执行标记的结果必须提供实际 seed 与完整时间字段。
+
+`--formal` 额外要求至少三次完整重复、预热至少 30 秒、完整双仓/引擎 commit、模型
+SHA-256 和非空报告/CSV、至少两张 PNG。CSV/PNG 与人工结论仅检查产物存在性；
+声明的 SHA 与环境也不等于已核验文件内容或真实 GPU 执行，仍需原始运行与 correctness 证据。
+
+`--json` 输出校验错误、历史限制和各组合 TTFT p95、token/request 吞吐的收敛状态。
+完整三次以上重复采用上述 10% 门槛；全零的相对波动为 0；无可用值为 `unavailable`，
+可用重复少于三次或覆盖不完整为 `insufficient_repeats`，不得声称已收敛。
+`non_converged`、失败请求或低成功率是有效结果，不导致校验失败；数据矛盾、缺少正式
+门槛或配置混用才返回非零。校验通过不自动批准性能结论或稳定 SLO。
 
 ## 6. 图表规范（plots.py）
 
@@ -124,6 +157,10 @@ results/<date>-<gpu-slug>/
 - 输出 token 吞吐 vs 并发折线（token coverage 100% 才绘制）
 - SLO 曲线：TTFT p95 vs λ（泊松档）
 - 每张图 caption：`<engine> @ <commit>, <date>, <gpu>`
+- 绘图复用语义校验，写文件前拒绝坏数据与不兼容系列；`--out-dir` 支持历史只读重验。
+- CSV/图例声明被测引擎 commit 和量化，标题中的 loadgen commit 是发压代码来源。
+  `audit.json` 与 CSV 的收敛列保留 `non_converged`；任一重复的 token 吞吐不可用时，
+  整个组合的平均吞吐与 min/max 留空，不择取已知子集。
 
 CUDA Graph on/off 的配对 TPOT 图属于 tiny-llm 的 engine 层报告，不混入 serving 曲线。
 KV 利用率图属于后续能力，只有采样器真正实现并归档原始数据后才加入本规范。

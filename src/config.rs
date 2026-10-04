@@ -118,11 +118,18 @@ pub struct EngineConfig {
     pub memory_threshold: f32,
     /// GPU 执行超时的最大重试次数
     pub max_retry_attempts: u32,
+    /// 每个流式候选可缓冲的文本事件数；满队列时取消慢消费者。
+    #[serde(default = "default_event_channel_capacity")]
+    pub event_channel_capacity: u32,
     pub special_tokens: SpecialTokenIds,
     #[serde(default)]
     pub tokenizer: TokenizerConfig,
     #[serde(default)]
     pub serving: ServingConfig,
+}
+
+fn default_event_channel_capacity() -> u32 {
+    64
 }
 
 impl Default for EngineConfig {
@@ -136,6 +143,7 @@ impl Default for EngineConfig {
             max_total_tokens: 4096,
             memory_threshold: 0.9,
             max_retry_attempts: 2,
+            event_channel_capacity: default_event_channel_capacity(),
             special_tokens: SpecialTokenIds::default(),
             tokenizer: TokenizerConfig::default(),
             serving: ServingConfig::default(),
@@ -175,6 +183,9 @@ impl EngineConfig {
         }
         if self.max_total_tokens == 0 {
             return Err(ConfigError::InvalidMaxTotalTokens(self.max_total_tokens));
+        }
+        if self.event_channel_capacity == 0 {
+            return Err(ConfigError::InvalidEventChannelCapacity(0));
         }
         if !self.memory_threshold.is_finite()
             || self.memory_threshold <= 0.0
@@ -277,6 +288,24 @@ mod tests {
     #[test]
     fn test_default_config_is_valid() {
         assert!(EngineConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn event_channel_capacity_is_validated_and_defaults_for_old_json() {
+        let mut json = serde_json::to_value(EngineConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("event_channel_capacity");
+        let mut config: EngineConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.event_channel_capacity, 64);
+        assert!(config.validate().is_ok());
+        config.event_channel_capacity = 0;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::InvalidEventChannelCapacity(0))
+        );
+        config.event_channel_capacity = 1;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

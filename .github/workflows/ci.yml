@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'fix/**']
   pull_request:
     branches: [main, master]
 
@@ -17,6 +17,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  serving-evidence:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest discover -s benchmarks/serving -p 'test_*.py' -v
+      - run: python3 benchmarks/serving/validate_results.py --formal benchmarks/serving/results/2026-09-07-RTX3060Laptop-paged-serving-p2-batch-postprocess-streaming
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo check --locked --all-targets
+      - run: cargo test --locked
+
   check:
     runs-on: ubuntu-latest
     steps:
@@ -33,8 +53,20 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo build --verbose
-      - run: cargo test --verbose
-      - run: cargo test --doc --verbose
-      - run: cargo doc --no-deps
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo build --locked --verbose
+      - run: cargo test --locked --verbose
+      - name: 真实 tokenizer 缺少输入必须失败
+        run: |
+          export PSERV_TOKENIZER_JSON=/unavailable/tokenizer.json
+          export PSERV_TOKENIZER_FIXTURE=/unavailable/fixture.json
+          for missing_input in PSERV_TOKENIZER_JSON PSERV_TOKENIZER_FIXTURE; do
+            gate_status=0
+            gate_output=$(env -u "$missing_input" cargo test --locked --test tokenizer_real_diff -- --ignored 2>&1) || gate_status=$?
+            printf '%s\n' "$gate_output"
+            test "$gate_status" -eq 101
+            grep -F "真实 tokenizer 测试必须设置 $missing_input" <<< "$gate_output"
+            grep -F 'test result: FAILED. 0 passed; 1 failed;' <<< "$gate_output"
+          done
+      - run: cargo test --locked --doc --verbose
+      - run: cargo doc --locked --no-deps

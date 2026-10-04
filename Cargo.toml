@@ -2,7 +2,7 @@
 name = "paged-serving"
 version = "0.2.1"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 default-run = "paged-serving"
 description = "Learning-oriented LLM serving control plane with paged KV scheduling and continuous batching"
 authors = ["holtwood"]

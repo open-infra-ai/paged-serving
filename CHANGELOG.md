@@ -8,11 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- 2026-10-04 终态复用批次：真实后端越界后继续运行满四请求；prefill/decode 后
+  各取消四请求并复用同一实例，检查独立取消分类、一次终态与逻辑 KV 精确归零。
+  故意拦截释放通知的真实计算对照区分连续 KV 槽位耗尽与分页 KV 的探针盲区；
+  策略 1/2 用独立进程验证，不改生产 ABI，也不宣称 HTTP 断连或显存字节回收。
+- 2026-10-04 结果语义批次：Serving JSONL/summary/metadata 联合重算、标准库
+  正/负夹具门禁与独立 CI；`--json` 输出机器可读诊断，10% 波动标记 `non_converged`
+  而不隐藏负结果。正式校验要求至少三次重复与 30 秒预热；历史可选字段不回填。
+- 2026-10-04 CLI 批次：真实 loadgen 二进制与本地 TCP/SSE 的完整结果落盘回归，
+  覆盖 closed/Poisson、warmup 排除、错误详情、token coverage 和自定义 summary 路径。
+  原始请求增加 nullable `scheduled_arrival_ms` / `dispatch_offset_ms`，summary.config
+  增加 `arrival_schedule` 标记，作为 schema v1 的可选扩展；历史结果缺字段表示未采集。
+- 2026-10-04 指标批次：`CancellationReason`、`RequestState::Cancelled`、
+  `CompletedRequest.cancellation`、`EngineMetrics.cancelled_requests` 与
+  `paged_engine_cancelled_requests`；全部暴露指标有 HELP/TYPE。
+- 请求 guard 主动取消、shutdown 广播与每候选有界文本 mailbox（默认 64、可配）；
+  终态经独立 oneshot 投递，多候选直接拉取合并，CPU 测试覆盖静默 decode 断连、
+  handler abort、部分准入、慢消费者、末步投递失败和 backend 回收。
 - 请求取消与有界背压设计包（`docs/architecture/cancellation-backpressure-design.md`）：
   冻结 request 状态机所有权表、主动取消触发矩阵、四条 channel 的容量与
   overflow 策略、指标语义口径与测试方式；待评审后分 PR 实现（P0-001/002/003）。
 
 ### Fixed
+- 2026-10-04 真实测试执行批次：默认外部 tokenizer 差分明确标为 ignored，显式
+  执行缺输入即失败；启用 `tiny-llm` 的五个 GPU 集成用例缺输入直接失败。
+  CPU CI 验证缺 tokenizer/fixture 的失败出口，拒绝把编译失败或零测试当作通过；
+  README 给出串行执行与固定容量参数，区分历史 token oracle 与独立引擎对照。
+- 2026-10-04 结果语义批次：绘图写文件前拒绝模型/量化/commit 或负载参数不兼容
+  的系列；不平均 token coverage 完整的部分重复。CSV/图例区分被测引擎与发压代码
+  来源，附收敛状态与 `audit.json`，`--out-dir` 支持不覆盖历史产物的重验。
+- 2026-10-04 CLI 批次：Poisson 测量 RNG 从 seed 重置，两个模式的测量 prompt
+  按 measured_index 选择，避免预热吞吐改变正式输入；改为绝对 deadline，预热
+  到达不越过窗口。worker JoinError 向 CLI 传播，不静默输出不完整执行的报告。
+- 2026-10-04 指标批次：JSON 拒绝、后端错误、SSE 提前关闭与慢消费者溢出纳入
+  HTTP 错误计数；多个候选、handler 与 SSE 共用去重标记，未消费 SSE 的后端
+  失败同样可观测。最后一步已计算成功时的文本溢出仍计 HTTP 失败，不改引擎成功事实。
+- 成功 SSE 终态先排空文本；满队列和末步投递失败返回错误而非伪装完整成功。
+  `paged_inflight_requests` 覆盖 SSE body lifetime，而不在 handler 返回时提前递减。
 - 服务端不再因仅启用 `tiny-llm` 编译 feature 就被误认为正在使用真实 CUDA
   后端：新增显式 `--backend tiny-llm --model-path <model.gguf>` 运行时选择，并在
   feature、后端与模型参数不匹配时直接报错，避免性能实验静默落到 CPU reference。
@@ -21,6 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte-fallback 边界；中间片段与最终一次性 decode 保持严格等价。
 
 ### Changed
+- 2026-10-04 指标批次完成独立取消分类：engine failed 排除主动取消，慢消费者
+  溢出按失败统计；取消保持 HTTP 错误信封但不计 `paged_errors_total`。新增 public
+  enum 变体与 struct 字段是 Rust source-breaking change，穷尽匹配、struct literal
+  需迁移；C ABI 与 Cargo.lock 不变。此前“独立状态/指标待实现”的备注对应指标批次前基线。
+- `EngineConfig` 新增 `event_channel_capacity`，旧 JSON 缺省为 64；Rust 全字段构造需
+  补字段或使用 `..Default::default()`。`EngineError` 新增 `ShuttingDown`、`ConfigError`
+  新增 `InvalidEventChannelCapacity`（穷尽匹配需更新），
+  C ABI 不变。修复分支执行 locked MSRV 与 stable CI；取消独立状态/指标仍待实现。
 - README 与 serving benchmark 操作手册同步真实后端启动命令；`build.rs` 不再监听
   仅供测试使用、不会改变链接产物的 `TINY_LLM_MODEL` 环境变量。
 - 归档首份真实 CUDA serving 结果（21 个 run、原始请求、模型 SHA-256、硬件与

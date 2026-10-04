@@ -16,14 +16,37 @@ benchmarks/serving/
 │       ├── smoke.jsonl    # 3 条冒烟 prompt
 │       └── {short,work,long}.jsonl   # gen_synth.py 产出
 ├── run_sweep.sh           # 矩阵编排：dirty 检查 + 双层 metadata + loadgen
-├── plots.py               # 只读取权威 summary.json 生成图表
-├── validate_results.py    # 检查正式结果的必需产物与 JSON schema
+├── plots.py               # 语义校验后读取 summary，生成图表与 audit.json
+├── validate_results.py    # 原始请求/summary/metadata 一致性与收敛诊断
+├── test_validate_results.py # 标准库离线正/负夹具门禁
 ├── RESULT_REPORT_TEMPLATE.md # 人工结论、限制与复现命令模板
 └── results/<date>-<gpu>/  # 原始请求 + run summary + 环境/模型 metadata + 图表
 ```
 
 压测客户端是 [`src/bin/loadgen.rs`](../../src/bin/loadgen.rs)（闭环饱和 /
 开环泊松双模式，同一二进制零改动覆盖三个后端）。
+
+## CLI 回归验证
+
+```bash
+cargo test --locked --test loadgen_cli
+```
+
+测试启动真实 loadgen 子进程和本地 TCP/SSE 夹具服务器，联合核对 CLI 参数、warmup、
+closed/Poisson 发压、原始 JSONL 和 summary。相同 seed 的计划及测量 prompt 顺序
+不受预热次数影响；未知 token 保留 null，错误详情保留，tok/s 只在成功请求 token
+coverage 完整时输出。计划/实际 dispatch 字段的意义见 [方法论](methodology.md)。
+这组测试不需要 GPU，不是 CUDA serving 性能结果，也不验收生产服务端回收或网络压力。
+
+## 结果语义回归验证
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+    -s benchmarks/serving -p 'test_*.py' -v
+```
+
+标准库测试覆盖原始请求、聚合数字和配置被损坏后的拒绝行为，不需要 GPU 或 matplotlib。
+CI 单独运行此门禁并只读重验历史正式结果；不会因为 429 或 `non_converged` 而隐藏负结果。
 
 ## 快速开始
 
@@ -71,6 +94,18 @@ cp RESULT_REPORT_TEMPLATE.md results/<date>-<gpu>/report.md
 python3 validate_results.py --formal results/<date>-<gpu>/
 ```
 
+重验历史结果时把新图表写到独立目录，保留历史 CSV/PNG：
+
+```bash
+python3 validate_results.py --formal --json results/<date>-<gpu>/
+python3 plots.py results/<date>-<gpu>/ --out-dir /tmp/serving-reaudit
+```
+
+`--json` 只向 stdout 输出机器可读诊断，不修改结果包。数值/配置矛盾退出 1，参数错误
+退出 2；校验成功退出 0 只表示内部一致，不代表收敛、GPU correctness 或稳定 SLO。
+绘图在校验通过后才写产物，CSV 附带引擎 commit、模型 SHA、量化和收敛状态；
+`audit.json` 保留逐组合诊断。任一重复缺少 token 吞吐时，整个组合不平均已知子集。
+
 ## 结果索引
 
 | 日期 | 硬件 | 内容 | 目录 |
@@ -89,8 +124,9 @@ python3 validate_results.py --formal results/<date>-<gpu>/
 - 每个数字绑定硬件、驱动、双仓 commit、模型 SHA-256、量化格式和原始请求数据；
 - 失败、OOM、429、无法启动的对照与 token coverage 不足均写进 `report.md`。
 
-`validate_results.py` 只检查产物完整性，不会把通过检查误写成性能结论；只有人工填写
-`report.md` 的结论和限制后，结果才可被 README、简历或面试材料引用。
+`validate_results.py` 检查数据一致性和必需产物，不证明声明的硬件/模型实际参与执行，
+也不评判性能优劣；只有人工填写 `report.md` 的结论和限制后，结果才可被 README、
+简历或面试材料引用。历史可选字段缺失会显式诊断，不回填为零或随机 seed。
 
 ## 纪律提醒（摘要，全文见 methodology.md）
 

@@ -7,7 +7,7 @@
 [![CI](https://github.com/open-infra-ai/paged-serving/actions/workflows/ci.yml/badge.svg)](https://github.com/open-infra-ai/paged-serving/actions/workflows/ci.yml)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
 
 **面向学习与验证的 LLM Serving 控制面：Paged KV 调度、Continuous Batching 与 OpenAI API**
 
@@ -15,8 +15,8 @@
 > （分页 KV / continuous batching / 调度 / API）v0.2.0 已稳定；
 > 计算后端双路径：默认 CPU 参考执行器（确定性，供测试/CI），`tiny-llm` cargo feature
 > 下接入 [tiny-llm](https://github.com/open-infra-ai/tiny-llm) 真实 CUDA 后端，并已启用
-> **分页 KV（策略 1：block_tables 真实上传）**——3 并发 e2e 与 llama.cpp greedy
-> 逐 token 对齐、资源守恒成立。
+> **分页 KV（策略 1：block_tables 真实上传）**——3 并发 e2e 检查资源守恒；
+> Hello 请求与历史 llama.cpp greedy token oracle 全序列对齐，数学请求仅检查公共前缀。
 
 **[文档](#文档) | [更新日志](CHANGELOG.md)**
 
@@ -40,6 +40,7 @@ Paged-Serving 是一个基于 Rust 构建的 LLM Serving 控制面，以模块�
 | **内存压力感知** | 可配置的 OOM 防护 | ✅ |
 | **模块化架构** | 基于 Trait 的抽象设计 | ✅ |
 | **OpenAI 兼容服务器** | `/v1/completions` + `/v1/chat/completions` + SSE | ✅ |
+| **取消与有界文本队列** | 请求 guard 主动取消；每候选 mailbox + 带外终态；多候选直接拉取合并，CPU 失败回收测试覆盖 | ✅ |
 | **自动化验证** | unit、integration、server integration 与 property tests | ✅ |
 | **tiny-llm 真实后端** | `tiny-llm` feature 下接入 CUDA 后端，分页 KV（策略 1）默认启用，`PAGED_SERVING_TINY_LLM_STRATEGY=2` 可回退连续 KV；正常 greedy 把各序列末层 hidden 写入 GPU batch buffer，再批量执行 final RMSNorm、LM head 与 argmax，并一次回传整批结果；Transformer layer 仍逐序列；`PAGED_SERVING_TINY_LLM_MAX_SEQS`（默认 4）与 `PAGED_SERVING_TINY_LLM_DECODE_RESERVE`（默认 512）可按显存/生成长度调节容量 | ✅ |
 
@@ -147,11 +148,31 @@ Paged-Serving 是一个基于 Rust 构建的 LLM Serving 控制面，以模块�
 - 任何终止路径（完成 / 取消 / 失败 / 客户端断开）都归还 KV 块，内存利用率
   回到基线 —— 由穷举属性测试覆盖
 
+### 取消与慢客户端
+
+`RequestGuard` 随 unary future / SSE body 持有，退出时发送取消信号；引擎在步间
+检查信号，覆盖 pending、尚无可发送文本的 decode、`n>1` 部分准入失败与断连。
+同步 backend step 不能被中途打断。服务 shutdown 关闭提交队列并取消在途请求，
+`/readyz` 随引擎退出返回 503；这不是请求超时、抢占或 GPU 中断功能，
+HTTP 网络排空也没有强制 deadline。
+
+`EngineConfig.event_channel_capacity` 默认 64，可在 `--config` JSON 中设置，
+必须大于 0，旧 JSON 缺省该字段时使用默认值。引擎仅 `try_send`，满队列失败该候选，
+SSE 发出 `internal_error`（`slow consumer: event channel overflow`）和 `[DONE]`，
+不输出成功 usage。独立 oneshot 保证错误终态不被满队列挡住；成功终态先排空文本。
+非流式请求不订阅文本队列，长输出不会仅因超过此容量而被取消。
+
+多候选通过 `SelectAll` 直接拉取，没有第二层 fan-in 队列或转发任务；任一候选失败
+即聚合失败并取消其余候选。队列项数上界为 `n × capacity`，合并器另外最多持有
+每候选一项；这不是进程内存字节上界，完整输出、logprobs 和网络缓冲另计。
+默认 64 未经真实网络负载调优。实现取舍与测试定位见
+[取消与背压笔记](.agents/notes/implemented/feature/2026-10-04-bounded-events-and-cancellation.md)。
+
 ## 快速开始
 
 ### 环境要求
 
-- **Rust 1.82+** (2021 edition)
+- **Rust 1.88+** (2021 edition；以 `Cargo.lock` 为复现依赖集，CI 在 1.88.0 验证全部默认目标)
 - **Linux** (推荐 Ubuntu 20.04+) 或 **macOS**
 
 ### 安装
@@ -219,15 +240,28 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 | 指标名 | 类型 | 说明 |
 |--------|------|------|
-| `paged_requests_total` | counter | 累计 HTTP 请求数 |
-| `paged_errors_total` | counter | 累计错误响应数 |
-| `paged_inflight_requests` | gauge | 当前在途 HTTP 请求数 |
-| `paged_streaming_requests_total` | counter | 累计流式请求数 |
-| `paged_engine_active_sequences` | gauge | 引擎当前活跃序列数 |
+| `paged_requests_total` | counter | completion/chat HTTP 请求数，含被拒绝请求；健康检查、metrics 与未知路由不计入 |
+| `paged_errors_total` | counter | 请求拒绝、计算或应用层交付失败的 HTTP 请求数，每请求最多一次；不含主动取消 |
+| `paged_inflight_requests` | gauge | 当前 handler 或 SSE body 存活的 HTTP 请求数，不乘候选数 |
+| `paged_streaming_requests_total` | counter | 成功构建 SSE 的 HTTP 请求数；不乘 `n`，准入失败不计入 |
+| `paged_engine_active_sequences` | gauge | prefill/decode 候选数，不含 pending |
 | `paged_engine_kv_utilization` | gauge | KV 块池利用率（0.0–1.0） |
-| `paged_engine_completed_requests` | counter | 累计成功完成请求数 |
-| `paged_engine_failed_requests` | counter | 累计失败请求数 |
-| `paged_engine_tokens_generated_total` | counter | 累计生成 token 数 |
+| `paged_engine_completed_requests` | counter | 引擎计算成功的候选数；不等于 HTTP 完整交付成功数 |
+| `paged_engine_failed_requests` | counter | 引擎失败候选数，含完成前的慢消费者溢出，不含主动取消 |
+| `paged_engine_cancelled_requests` | counter | 完成前被主动取消的候选数（客户端退出、shutdown） |
+| `paged_engine_tokens_generated_total` | counter | 已排出终态候选生成的 token 总数，包含失败与取消前的部分输出 |
+
+每项指标都有 HELP/TYPE。候选终态记录错误，即使 SSE body 未被读取；handler 与
+SSE 使用同一个 HTTP 去重标记。末步文本溢出时 `engine_completed` 已增加，HTTP
+错误仍增加，引擎 failed/cancelled 不回写。SSE 提前关闭在 body 被消费时记录错误。
+各项原子值独立读取，且引擎项在步末刷新，不是跨项事务快照，更不是客户端收到
+响应的网络确认。
+
+`RequestState::Cancelled(CancellationReason)` 与 `CompletedRequest.cancellation` 保留
+取消类型；`EngineMetrics.cancelled_requests` 单独计数。Rust 穷尽匹配与 struct literal
+需要更新，C ABI 不变。取消的 HTTP 错误信封保持原 500 / `internal_error` 形状，
+但不增加 `paged_errors_total`，因此该指标不是所有 HTTP 5xx 的计数。独立计数口径见
+[指标决策](.agents/notes/implemented/bug-fix/2026-10-04-typed-cancellation-and-metrics.md)。
 
 ### 库用法
 
@@ -378,8 +412,8 @@ token id；`logprobs` 仍走主机完整 logits / top-k 路径。因此 continuo
 ## 测试
 
 ```bash
-# 运行所有测试
-cargo test
+# 运行默认 CPU 回归；外部 tokenizer 验证显示 ignored，GPU 目标未启用
+cargo test --locked
 
 # 运行覆盖率测试
 cargo llvm-cov --html
@@ -394,6 +428,52 @@ cargo test -- --test-threads=1
 | 属性测试 | 状态不变量 | 资源守恒、队列唯一性和容量上限 |
 | 集成测试 | 端到端工作流 | engine 与请求生命周期 |
 | Server 集成 | HTTP/SSE | API、取消、健康检查与指标 |
+
+真实输入的验证需要显式执行。以下命令从本仓根目录运行，路径按实际 checkout 调整：
+
+```bash
+export PSERV_TOKENIZER_JSON=../models/tokenizer.json
+export PSERV_TOKENIZER_FIXTURE=../tiny-llm/tests/data/tokenizer_fixture.json
+
+# 不需要 GPU；真实 tokenizer 与 HF fixture 逐 id 比较
+cargo test --locked --test tokenizer_real_diff -- --ignored
+
+# 使用干净、已记录 commit 的 tiny-llm 源码构建当前静态库，不复用来源未知的旧库
+cmake --build ../tiny-llm/build --target tiny_llm --parallel 2
+export TINY_LLM_DIR=../tiny-llm/build
+export TINY_LLM_MODEL=../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+export PAGED_SERVING_TINY_LLM_STRATEGY=1
+export PAGED_SERVING_TINY_LLM_MAX_SEQS=4
+export PAGED_SERVING_TINY_LLM_DECODE_RESERVE=512
+
+# 串行运行 4 个 GPU 接入/生命周期用例（含故障对照）、3 个 GPU 文本与 1 个 tokenizer 测试
+cargo test --locked --features tiny-llm \
+  --test tiny_llm_backend --test tiny_llm_text_e2e --test tokenizer_real_diff \
+  -- --include-ignored --test-threads=1
+
+# 分别以分页 KV / 连续 KV 验证终态后的同实例复用；每种策略使用独立进程
+for strategy in 1 2; do
+  PAGED_SERVING_TINY_LLM_STRATEGY="$strategy" \
+    cargo test --locked --features tiny-llm --test tiny_llm_backend \
+    -- --test-threads=1 --nocapture
+done
+```
+
+GPU 命令要求已有 CMake 构建目录、CUDA 工具链、兼容 GPU、模型与匹配 tokenizer；
+缺库会链接失败，缺运行时输入、加载失败或 GPU 错误会使测试失败，不记为通过。
+若调整 decode reserve，越界回归的触发条件也会改变；此命令固定为 512。
+文本用例检查固定的 Qwen2.5-0.5B 历史 oracle，不是本次启动 llama.cpp 的独立对照，
+也不适用于任意模型。固定 token 不匹配时应报告失败、鉴别原因，不自动改期望。
+提交测试证据时记录双仓源码状态、输入和静态库 SHA-256；默认 CPU 绿色不代表 GPU
+验证，单次 GPU 功能验证也不代表持续门禁、HTTP 取消回收或性能结论。执行语义见
+[真实测试门禁笔记](.agents/notes/implemented/testing/2026-10-04-real-test-execution-gates.md)。
+
+生命周期用例覆盖越界失败后四请求复用，以及 prefill/decode 后取消四请求、再成功
+运行四请求；逻辑 KV 必须精确归零。测试还故意拦截后端释放通知：连续 KV 的
+下一批会分配失败，分页 KV 的下一批仍能运行。因此“利用率归零且能再服务”
+不能证明分页序列登记没有泄漏。此负对照是测试预期，不是正常后端报错；限制见
+[终态复用笔记](.agents/notes/implemented/testing/2026-10-04-real-backend-terminal-reuse.md)。
+这些取消发生在同步 GPU step 返回后，不证明 kernel 抢占、HTTP 断连或显存字节释放。
 
 ## 贡献指南
 

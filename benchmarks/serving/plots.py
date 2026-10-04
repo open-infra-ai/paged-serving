@@ -12,65 +12,54 @@
     throughput_by_concurrency.png 闭环输出 token 吞吐 × 并发
     slo_curve.png                 泊松 TTFT p95 × 到达率
     summary_table.csv             全指标与重复波动
+    audit.json                    校验、收敛状态与声明的模型/引擎来源
 """
 
+import argparse
 import csv
 import json
-import re
 import sys
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-
-
-DIR_RE = re.compile(
-    r"^(?P<engine>.+)_(?P<mode>closed|poisson)_"
-    r"(?P<tag>c[\d.]+|rate[\d.]+)_(?P<ds>\w+)_r(?P<rep>\d+)$"
-)
+from validate_results import audit_package
 
 
 def nested(data, *path):
     current = data
     for key in path:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-        if current is None:
-            return None
+        current = current[key]
     return current
 
 
-def load_run(run_dir: Path):
-    """读取 loadgen 权威汇总，并验证逐请求原始数据仍然存在。"""
-    summary_path = run_dir / "summary.json"
-    requests_path = run_dir / "per_request.jsonl"
-    if not summary_path.is_file() or not requests_path.is_file():
-        raise ValueError(f"不完整 run：{run_dir} 必须同时含 summary.json 与 per_request.jsonl")
-    summary = json.loads(summary_path.read_text())
-    if summary.get("schema_version") != 1:
-        raise ValueError(f"不支持的 summary schema：{summary_path}")
-    return summary
+def collect_groups(root: Path):
+    report, runs, metadata = audit_package(root)
+    if report["errors"]:
+        details = "\n".join(f"{i['code']}: {i['location']}: {i['message']}" for i in report["errors"])
+        raise ValueError(f"拒绝绘制无效或不兼容结果：\n{details}")
+    groups = {}
+    for run in runs:
+        groups.setdefault(run["group"], []).append(run["summary"])
+    return groups, report, metadata
 
 
 def values_at(runs, *path):
-    return [value for run in runs if (value := nested(run, *path)) is not None]
+    values = [nested(run, *path) for run in runs]
+    # 不能只选 token coverage 完整的重复，偷偷排除其余 run 后平均。
+    return [] if any(value is None for value in values) else values
 
 
 def aggregate(runs, *path):
     values = values_at(runs, *path)
     if not values:
         return None
-    return sum(values) / len(values)
+    return sum(value / len(values) for value in values)
 
 
 def spread(runs, *path):
     values = values_at(runs, *path)
     if not values:
         return None, None, None
-    return sum(values) / len(values), min(values), max(values)
+    return sum(value / len(values) for value in values), min(values), max(values)
 
 
 def tag_value(tag: str) -> float:
@@ -81,8 +70,8 @@ def tag_value(tag: str) -> float:
     raise ValueError(f"未知负载标签：{tag}")
 
 
-def series_label(engine: str, dataset: str) -> str:
-    return f"{engine}/{dataset}"
+def series_label(engine: str, dataset: str, row) -> str:
+    return f"{engine}/{dataset} @ {row['engine_commit'][:7]}, {row['backend_quant']}"
 
 
 def write_csv(root: Path, rows):
@@ -100,7 +89,7 @@ def write_csv(root: Path, rows):
     print(f"written {csv_path}")
 
 
-def plot_closed_ttft(root: Path, rows, caption: str):
+def plot_closed_ttft(root: Path, rows, caption: str, plt):
     closed = [row for row in rows if row["mode"] == "closed"]
     if not closed:
         return
@@ -124,7 +113,7 @@ def plot_closed_ttft(root: Path, rows, caption: str):
         means = [row["ttft_p95"] for row in subset]
         lows = [row["ttft_p95_min"] for row in subset]
         highs = [row["ttft_p95_max"] for row in subset]
-        axis.plot(x_values, means, marker="o", label=series_label(engine, dataset))
+        axis.plot(x_values, means, marker="o", label=series_label(engine, dataset, subset[0]))
         axis.fill_between(x_values, lows, highs, alpha=0.15)
         plotted = True
     if not plotted:
@@ -142,7 +131,7 @@ def plot_closed_ttft(root: Path, rows, caption: str):
     print(f"written {path}")
 
 
-def plot_closed_throughput(root: Path, rows, caption: str):
+def plot_closed_throughput(root: Path, rows, caption: str, plt):
     closed = [row for row in rows if row["mode"] == "closed"]
     if not closed:
         return
@@ -170,7 +159,7 @@ def plot_closed_throughput(root: Path, rows, caption: str):
             x_values,
             means,
             marker="o",
-            label=series_label(engine, dataset),
+            label=series_label(engine, dataset, subset[0]),
         )
         axis.fill_between(x_values, lows, highs, alpha=0.15)
         plotted = True
@@ -189,7 +178,7 @@ def plot_closed_throughput(root: Path, rows, caption: str):
     print(f"written {path}")
 
 
-def plot_poisson_slo(root: Path, rows, caption: str):
+def plot_poisson_slo(root: Path, rows, caption: str, plt):
     poisson = [row for row in rows if row["mode"] == "poisson"]
     if not poisson:
         return
@@ -217,7 +206,7 @@ def plot_poisson_slo(root: Path, rows, caption: str):
             x_values,
             means,
             marker="s",
-            label=series_label(engine, dataset),
+            label=series_label(engine, dataset, subset[0]),
         )
         axis.fill_between(x_values, lows, highs, alpha=0.15)
         plotted = True
@@ -236,30 +225,29 @@ def plot_poisson_slo(root: Path, rows, caption: str):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(__doc__)
-        sys.exit(2)
-    root = Path(sys.argv[1])
-    metadata_path = root / "metadata.json"
-    if not metadata_path.is_file():
-        raise SystemExit(f"缺少 metadata.json：{metadata_path}")
-    metadata = json.loads(metadata_path.read_text())
-    commit = metadata.get("commits", {}).get("paged_serving", "?")[:10]
-    date = metadata.get("date", "?")
-    gpu = metadata.get("hardware", {}).get("gpu", "?")
-    caption = f"@ {commit}, {date}, {gpu}"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", type=Path)
+    parser.add_argument("--out-dir", type=Path, help="产物输出目录；重验历史结果时使用独立目录")
+    args = parser.parse_args()
+    try:
+        groups, report, metadata = collect_groups(args.root)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    # 校验先于任何输出和可选 matplotlib 依赖，坏数据不会留下半套图表。
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-    groups = {}
-    for directory in sorted(root.iterdir()):
-        match = DIR_RE.match(directory.name)
-        if not match:
-            continue
-        key = (match["engine"], match["mode"], match["tag"], match["ds"])
-        groups.setdefault(key, []).append(load_run(directory))
+    root = args.out_dir or args.root
+    root.mkdir(parents=True, exist_ok=True)
+    commit = metadata["commits"]["paged_serving"][:10]
+    date = metadata["date"]
+    gpu = metadata["hardware"]["gpu"]
+    caption = f"loadgen @ {commit}, {date}, {gpu}"
 
-    if not groups:
-        raise SystemExit(f"{root} 下没有完整的结果子目录")
-
+    convergence = {tuple(group["key"]): group["metrics"] for group in report["groups"]}
+    provenance = {tuple(group["key"]): group["provenance"] for group in report["groups"]}
     rows = []
     for (engine, mode, tag, dataset), runs in sorted(groups.items()):
         ttft_p95, ttft_p95_min, ttft_p95_max = spread(runs, "ttft_ms", "p95")
@@ -273,6 +261,7 @@ def main():
                 "tag": tag,
                 "dataset": dataset,
                 "repeats": len(runs),
+                **provenance[(engine, mode, tag, dataset)],
                 "success_rate_pct": aggregate(runs, "requests", "success_rate_pct"),
                 "ttft_p50": aggregate(runs, "ttft_ms", "p50"),
                 "ttft_p95": ttft_p95,
@@ -293,14 +282,21 @@ def main():
                 "throughput_req_s": aggregate(
                     runs, "throughput", "successful_requests_per_second"
                 ),
+                "ttft_convergence": convergence[(engine, mode, tag, dataset)]["ttft_p95_ms"]["status"],
+                "throughput_convergence": convergence[(engine, mode, tag, dataset)]["output_tokens_per_second"]["status"],
             }
         )
 
     write_csv(root, rows)
-    plot_closed_ttft(root, rows, caption)
-    plot_closed_throughput(root, rows, caption)
-    plot_poisson_slo(root, rows, caption)
+    (root / "audit.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+    plot_closed_ttft(root, rows, caption, plt)
+    plot_closed_throughput(root, rows, caption, plt)
+    plot_poisson_slo(root, rows, caption, plt)
+    for group in report["groups"]:
+        if any(metric["status"] == "non_converged" for metric in group["metrics"].values()):
+            print(f"non_converged: {'/'.join(group['key'])}；原始重复全部保留，详见 audit.json")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

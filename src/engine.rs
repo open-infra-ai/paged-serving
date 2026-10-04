@@ -128,6 +128,7 @@ pub struct InferenceEngine {
     total_requests: u64,
     completed_requests_count: u64,
     failed_requests_count: u64,
+    cancelled_requests_count: u64,
     total_tokens_generated: u64,
     next_request_id: RequestId,
 }
@@ -173,6 +174,7 @@ impl InferenceEngine {
             total_requests: 0,
             completed_requests_count: 0,
             failed_requests_count: 0,
+            cancelled_requests_count: 0,
             total_tokens_generated: 0,
             next_request_id: 1,
         })
@@ -207,6 +209,7 @@ impl InferenceEngine {
             total_requests: 0,
             completed_requests_count: 0,
             failed_requests_count: 0,
+            cancelled_requests_count: 0,
             total_tokens_generated: 0,
             next_request_id: 1,
         })
@@ -477,7 +480,12 @@ impl InferenceEngine {
                 };
                 let error = match (&req.state, tokenization_error) {
                     (RequestState::Failed(msg), _) => Some(msg.clone()),
+                    (RequestState::Cancelled(reason), _) => Some(reason.to_string()),
                     (_, Some(msg)) => Some(format!("tokenizer decode failed: {msg}")),
+                    _ => None,
+                };
+                let cancellation = match req.state {
+                    RequestState::Cancelled(reason) => Some(reason),
                     _ => None,
                 };
                 // logprobs：请求启用且后端实际提供了时才返回
@@ -505,6 +513,8 @@ impl InferenceEngine {
                 self.total_tokens_generated += req.output_tokens.len() as u64;
                 if success {
                     self.completed_requests_count += 1;
+                } else if cancellation.is_some() {
+                    self.cancelled_requests_count += 1;
                 } else {
                     self.failed_requests_count += 1;
                 }
@@ -516,6 +526,7 @@ impl InferenceEngine {
                     output_tokens: req.output_tokens,
                     success,
                     error,
+                    cancellation,
                     finish_reason,
                     logprobs,
                 }
@@ -598,10 +609,23 @@ impl InferenceEngine {
 
     /// 按 request_id 取消请求（客户端断连时由服务层调用）。
     ///
-    /// 序列无论处于哪个阶段都会被标记失败并释放 KV 资源；
+    /// 序列无论处于哪个阶段都会被标记取消并释放 KV 资源；
     /// 其终态会在下一步经常规完成通道排出。返回是否取消成功。
     pub fn cancel_request(&mut self, request_id: RequestId) -> bool {
         self.scheduler.cancel_by_request_id(request_id)
+    }
+
+    pub fn cancel_request_with_reason(
+        &mut self,
+        request_id: RequestId,
+        reason: crate::types::CancellationReason,
+    ) -> bool {
+        self.scheduler
+            .cancel_by_request_id_with_reason(request_id, reason)
+    }
+
+    pub(crate) fn fail_request(&mut self, request_id: RequestId, reason: &str) -> bool {
+        self.scheduler.fail_by_request_id(request_id, reason)
     }
 
     /// 当前存活的每请求增量解码器数量（测试用：验证状态随终态清理）。
@@ -640,7 +664,7 @@ impl InferenceEngine {
 /// 由 [`InferenceEngine::step_events`] 产生，供服务层驱动流式响应。
 #[derive(Debug, Clone, Default)]
 pub struct StepEvents {
-    /// 本步到达终态（成功或失败）的请求
+    /// 本步到达终态（成功、失败或取消）的请求
     pub completed: Vec<CompletedRequest>,
     /// 本步为各请求新生成的文本片段（见 [`StepChunk`]）
     pub chunks: Vec<StepChunk>,
@@ -655,8 +679,10 @@ pub struct EngineMetrics {
     pub total_requests: u64,
     /// 成功完成请求总数
     pub completed_requests: u64,
-    /// 失败请求总数
+    /// 失败请求总数（不含主动取消）
     pub failed_requests: u64,
+    /// 主动取消请求总数
+    pub cancelled_requests: u64,
     /// 已生成 token 总数
     pub total_tokens_generated: u64,
     /// 当前内存利用率
@@ -685,6 +711,7 @@ impl InferenceEngine {
             total_requests: self.total_requests,
             completed_requests: self.completed_requests_count,
             failed_requests: self.failed_requests_count,
+            cancelled_requests: self.cancelled_requests_count,
             total_tokens_generated: self.total_tokens_generated,
             memory_utilization: self.memory_utilization(),
             active_sequences: self.scheduler.num_active_sequences() as u32,
@@ -871,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cancel_request_stops_generation_and_surfaces_failure() {
+    fn test_cancel_request_stops_generation_and_surfaces_typed_cancellation() {
         let mut engine = InferenceEngine::new(create_test_config()).unwrap();
         let (request_id, _) = engine
             .submit_request(
@@ -1286,10 +1313,80 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert!(!completed[0].success);
         assert_eq!(
+            completed[0].cancellation,
+            Some(crate::CancellationReason::ClientDisconnected)
+        );
+        assert_eq!(engine.get_metrics().cancelled_requests, 1);
+        assert_eq!(engine.get_metrics().failed_requests, 0);
+        assert_eq!(
             *finished.lock().unwrap(),
             vec![1],
             "cancel must also notify backend to release KV"
         );
+    }
+
+    #[test]
+    fn test_terminal_metrics_use_state_not_error_text() {
+        use crate::CancellationReason;
+
+        let config = create_test_config();
+        let (executor, finished) = RecordingExecutor::new(false);
+        let mut engine = InferenceEngine::with_components(
+            config.clone(),
+            Box::new(SimpleTokenizer::new()),
+            Scheduler::new(config),
+            Box::new(executor),
+        )
+        .unwrap();
+        let (success, _) = engine.submit_request("success", test_params(1)).unwrap();
+        let (client, _) = engine.submit_request("client", test_params(4)).unwrap();
+        let (shutdown, _) = engine.submit_request("shutdown", test_params(4)).unwrap();
+        let (failed, _) = engine.submit_request("failed", test_params(4)).unwrap();
+        assert!(engine.cancel_request(client));
+        assert!(engine.cancel_request_with_reason(shutdown, CancellationReason::ServerShutdown));
+        // 同样的文案仍是 Failed，不能被字符串前缀误判为取消。
+        assert!(engine.fail_request(failed, "request cancelled: backend failure"));
+        let completed = engine.run();
+        assert_eq!(completed.len(), 4);
+        assert!(
+            completed
+                .iter()
+                .find(|r| r.request_id == success)
+                .unwrap()
+                .success
+        );
+        assert_eq!(
+            completed
+                .iter()
+                .find(|r| r.request_id == shutdown)
+                .unwrap()
+                .cancellation,
+            Some(CancellationReason::ServerShutdown)
+        );
+        assert!(completed
+            .iter()
+            .find(|r| r.request_id == failed)
+            .unwrap()
+            .cancellation
+            .is_none());
+        let metrics = engine.get_metrics();
+        assert_eq!(metrics.total_requests, 4);
+        assert_eq!(metrics.completed_requests, 1);
+        assert_eq!(metrics.failed_requests, 1);
+        assert_eq!(metrics.cancelled_requests, 2);
+        assert_eq!(metrics.total_tokens_generated, 1);
+        assert_eq!(metrics.active_sequences, 0);
+        assert_eq!(metrics.memory_utilization, 0.0);
+        assert!(engine.run().is_empty());
+        assert!(!engine.cancel_request(client));
+        let mut ids = finished.lock().unwrap().clone();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4],
+            "all terminal resources released exactly once"
+        );
+        assert_eq!(engine.get_metrics().cancelled_requests, 2);
     }
 
     #[test]

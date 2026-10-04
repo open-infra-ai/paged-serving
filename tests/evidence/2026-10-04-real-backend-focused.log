@@ -1,0 +1,88 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.24s
+     Running tests/tiny_llm_backend.rs (target/debug/deps/tiny_llm_backend-890c7daaa763965f)
+
+running 2 tests
+test tiny_llm_backend_decode_overrun_reports_clear_error ... [2026-10-04 16:27:01.961] [info] [462625] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:01.961] [info] [462625] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 16:27:02.006] [info] [462625] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 16:27:02.006] [info] [462625] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 16:27:02.006] [info] [462625] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:02.006] [info] [462625] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:02.006] [info] [462625] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 16:27:02.037] [info] [462625] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 16:27:02.037] [info] [462625] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 16:27:02.037] [info] [462625] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+ok
+test tiny_llm_backend_end_to_end ... [2026-10-04 16:27:21.071] [info] [462711] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:21.072] [info] [462711] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 16:27:21.102] [info] [462711] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 16:27:21.102] [info] [462711] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 16:27:21.102] [info] [462711] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:21.102] [info] [462711] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:21.102] [info] [462711] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 16:27:21.129] [info] [462711] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 16:27:21.129] [info] [462711] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 16:27:21.130] [info] [462711] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.44s
+
+     Running tests/tiny_llm_text_e2e.rs (target/debug/deps/tiny_llm_text_e2e-6f6be8d276544022)
+
+running 3 tests
+test qwen2_chat_prompt_matches_llama_cpp ... [2026-10-04 16:27:40.029] [info] [462757] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:40.029] [info] [462757] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 16:27:40.070] [info] [462757] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 16:27:40.070] [info] [462757] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 16:27:40.070] [info] [462757] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:40.070] [info] [462757] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:40.070] [info] [462757] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 16:27:40.107] [info] [462757] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 16:27:40.107] [info] [462757] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 16:27:40.107] [info] [462757] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+prompt_tokens=14
+output_tokens(24) = [9707, 0, 358, 2776, 1101, 264, 6366, 2025, 11, 773, 358, 1513, 944, 614, 15650, 13, 2585, 646, 358, 7789, 498, 3351, 30, 151645]
+output_text = "Hello! I'm just a computer program, so I don't have feelings. How can I assist you today?"
+finish_reason = Some(Stop)
+对比: 期望 24 个 token
+ok
+test qwen2_text_generation_end_to_end ... [2026-10-04 16:27:57.067] [info] [463434] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:57.094] [info] [463434] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 16:27:57.175] [info] [463434] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 16:27:57.175] [info] [463434] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 16:27:57.175] [info] [463434] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:57.176] [info] [463434] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:27:57.176] [info] [463434] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 16:27:57.258] [info] [463434] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 16:27:57.259] [info] [463434] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 16:27:57.259] [info] [463434] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+prompt_tokens=6 (Hello, how are you?)
+output_tokens(32) = [358, 2776, 264, 48948, 304, 13027, 323, 358, 2776, 4460, 311, 1855, 264, 2025, 429, 646, 1349, 264, 1467, 1034, 323, 1760, 279, 1372, 315, 4244, 304, 432, 13, 2980, 498, 1492]
+output_text = " I'm a beginner in Python and I'm trying to create a program that can read a text file and count the number of words in it. Can you help"
+finish_reason = Some(Length)
+ok
+test qwen2_three_concurrent_paged_requests_match_llama_cpp ... [2026-10-04 16:28:17.554] [info] [463542] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:28:17.554] [info] [463542] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 16:28:17.587] [info] [463542] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 16:28:17.587] [info] [463542] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 16:28:17.587] [info] [463542] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:28:17.587] [info] [463542] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-04 16:28:17.587] [info] [463542] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-04 16:28:17.620] [info] [463542] GGUF parsing complete. Data offset: 5947744
+[2026-10-04 16:28:17.620] [info] [463542] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-04 16:28:17.620] [info] [463542] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+request1: id=1 tokens=[9707, 0, 358, 2776, 1101, 264, 6366, 2025, 11, 773, 358, 1513, 944, 614, 15650, 13, 2585, 646, 358, 7789, 498, 3351, 30, 151645] text="Hello! I'm just a computer program, so I don't have feelings. How can I assist you today?"
+request2: id=2 tokens=[17, 10, 17, 374, 220, 19, 13, 151645] text="2+2 is 4."
+request3: id=3 tokens=[271, 40, 1079, 4460, 311, 1855, 264, 4285, 2025, 429, 686, 1896, 264, 914, 323, 264, 1372, 438, 1946, 11, 323, 1221, 2550, 279, 914, 448, 279, 1372, 315, 5766, 6963, 13] text="\n\nI am trying to create a simple program that will take a string and a number as input, and then output the string with the number of characters removed."
+metrics: active_sequences=0 memory_utilization=0.000
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 48.91s
+
+     Running tests/tokenizer_real_diff.rs (target/debug/deps/tokenizer_real_diff-f517d9569b156466)
+
+running 1 test
+test qwen2_tokenizer_matches_tiny_llm_fixture ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+

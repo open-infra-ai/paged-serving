@@ -4,31 +4,134 @@
 //! - 编译期：`cargo test --features tiny-llm`（启用 C ABI 符号与适配器）
 //! - 链接期：`TINY_LLM_DIR` 指向 tiny-llm 构建目录（build.rs）
 //! - 运行期：`TINY_LLM_MODEL` 指向真实 GGUF 模型
+//! - 启用 feature 后缺少模型直接失败，不将未执行记为通过
 //!
 //! 使用 paged-serving 自带的 SimpleTokenizer（词表语义与 Qwen 不同），
 //! 本测试验证的是**接入流程正确性**（引擎驱动、KV 生命周期、资源守恒、
 //! 能力声明），而非文本质量；文本质量验证需接入与模型词表一致的 tokenizer。
 //!
-//! 注意：单个测试进程只 load 一次模型（0.5B 模型 + 多序列 KV 在 6GB 卡上
-//! 无法容纳多次并发实例），因此能力检查与端到端流程合并在同一测试内。
+//! 使用 `--test-threads=1` 串行执行本目标，避免测试同时加载模型。
+//! 每个测试复用自己的后端实例；能力检查与两波请求合并验证实例复用。
+//! 策略 1/2 分别执行：连续 KV 满容量复用能识别漏释放，分页 KV 还需独立登记检查。
 
 #![cfg(feature = "tiny-llm")]
 
+use paged_serving::gpu_executor::ExecutorCapabilities;
 use paged_serving::test_utils::create_test_config;
 use paged_serving::{
-    EngineError, GenerationParams, InferenceEngine, Scheduler, SimpleTokenizer, TinyLlmExecutor,
+    CancellationReason, CompletedRequest, EngineConfig, EngineError, ExecutionBatch,
+    ExecutionOutput, GPUExecutorTrait, GenerationParams, InferenceEngine, RequestId, Scheduler,
+    SimpleTokenizer, TinyLlmExecutor,
 };
 
-fn model_path() -> Option<String> {
-    std::env::var("TINY_LLM_MODEL").ok()
+fn model_path() -> String {
+    std::env::var("TINY_LLM_MODEL").expect("真实后端测试必须设置 TINY_LLM_MODEL")
+}
+
+fn submit_full_batch(engine: &mut InferenceEngine, max_tokens: u32) -> Vec<RequestId> {
+    (0..4)
+        .map(|i| {
+            engine
+                .submit_request(
+                    &format!("prompt {i}"),
+                    GenerationParams {
+                        max_tokens,
+                        ..GenerationParams::default()
+                    },
+                )
+                .unwrap()
+                .0
+        })
+        .collect()
+}
+
+fn assert_idle(engine: &InferenceEngine) {
+    assert!(!engine.has_pending_work(), "终态排出后不应残留待处理请求");
+    let metrics = engine.get_metrics();
+    assert_eq!(metrics.active_sequences, 0);
+    assert_eq!(metrics.memory_utilization, 0.0, "逻辑 KV 必须精确归零");
+}
+
+fn cancel_full_batch(engine: &mut InferenceEngine, steps: usize) {
+    let mut request_ids = submit_full_batch(engine, 32);
+    for _ in 0..steps {
+        assert!(engine.step().unwrap().is_empty(), "取消前不得提前终止");
+        assert_eq!(engine.get_metrics().active_sequences, 4);
+    }
+    for &id in &request_ids {
+        assert!(engine.cancel_request(id));
+        assert!(!engine.cancel_request(id), "同一请求不能重复取消");
+    }
+
+    let events = engine.step_events().unwrap();
+    assert!(events.chunks.is_empty(), "取消不应冲刷剩余文本");
+    assert_eq!(events.completed.len(), 4);
+    for c in &events.completed {
+        assert!(!c.success);
+        assert_eq!(c.cancellation, Some(CancellationReason::ClientDisconnected));
+        assert_eq!(c.finish_reason, None);
+        assert_eq!(
+            c.output_tokens.len(),
+            steps,
+            "必须实际执行过 prefill/decode"
+        );
+    }
+    request_ids.sort_unstable();
+    let mut completed_ids: Vec<_> = events.completed.iter().map(|c| c.request_id).collect();
+    completed_ids.sort_unstable();
+    assert_eq!(completed_ids, request_ids, "每个请求终态必须恰好排出一次");
+    assert_idle(engine);
+    assert!(engine.step_events().unwrap().completed.is_empty());
+}
+
+fn run_reuse_probe(engine: &mut InferenceEngine) -> Vec<CompletedRequest> {
+    let mut request_ids = submit_full_batch(engine, 4);
+    let completed = engine.run();
+    assert_eq!(completed.len(), 4);
+    request_ids.sort_unstable();
+    let mut completed_ids: Vec<_> = completed.iter().map(|c| c.request_id).collect();
+    completed_ids.sort_unstable();
+    assert_eq!(completed_ids, request_ids);
+    assert_idle(engine);
+    completed
+}
+
+fn lifecycle_config() -> EngineConfig {
+    let mut config = create_test_config();
+    config.max_num_blocks = 256;
+    config.max_model_len = 256;
+    config.max_total_tokens = 1024;
+    config.max_batch_size = 4;
+    config.max_num_seqs = 4;
+    config
+}
+
+fn lifecycle_engine(config: EngineConfig, executor: Box<dyn GPUExecutorTrait>) -> InferenceEngine {
+    InferenceEngine::with_components(
+        config.clone(),
+        Box::new(SimpleTokenizer::new()),
+        Scheduler::new(config),
+        executor,
+    )
+    .unwrap()
+}
+
+// 刻意使用 trait 的空 sequences_finished：保留真实计算，只拦截释放通知。
+struct WithheldRelease(TinyLlmExecutor);
+
+impl GPUExecutorTrait for WithheldRelease {
+    fn execute(&mut self, batch: &ExecutionBatch) -> Result<ExecutionOutput, EngineError> {
+        self.0.execute(batch)
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.0.capabilities()
+    }
 }
 
 #[test]
 fn tiny_llm_backend_end_to_end() {
-    let Some(path) = model_path() else {
-        eprintln!("skip: set TINY_LLM_MODEL to a GGUF file to enable");
-        return;
-    };
+    let path = model_path();
 
     let mut config = create_test_config();
     config.max_num_blocks = 256;
@@ -72,7 +175,7 @@ fn tiny_llm_backend_end_to_end() {
 
     // 资源守恒：全部完成后 KV 归还
     let util = engine.memory_utilization();
-    assert!(util < 0.05, "tiny-llm KV 未归还: {util}");
+    assert_eq!(util, 0.0, "tiny-llm 逻辑 KV 未归还");
 
     let m = engine.get_metrics();
     assert_eq!(m.completed_requests, 3);
@@ -101,7 +204,7 @@ fn tiny_llm_backend_end_to_end() {
     }
 
     let util2 = engine.memory_utilization();
-    assert!(util2 < 0.05, "第二波后 tiny-llm KV 未归还: {util2}");
+    assert_eq!(util2, 0.0, "第二波后 tiny-llm 逻辑 KV 未归还");
 
     let m2 = engine.get_metrics();
     assert_eq!(m2.completed_requests, 6);
@@ -115,10 +218,7 @@ fn tiny_llm_backend_end_to_end() {
 /// TotalLengthTooLong 校验上限，但解码步数超过首次分配的 KV 容量。
 #[test]
 fn tiny_llm_backend_decode_overrun_reports_clear_error() {
-    let Some(path) = model_path() else {
-        eprintln!("skip: set TINY_LLM_MODEL to a GGUF file to enable");
-        return;
-    };
+    let path = model_path();
 
     let mut config = create_test_config();
     // max_model_len 需容纳 prompt + 超过 decode 预留默认值(512) 的 max_tokens，
@@ -126,6 +226,8 @@ fn tiny_llm_backend_decode_overrun_reports_clear_error() {
     config.max_num_blocks = 256;
     config.max_model_len = 1024;
     config.max_total_tokens = 1024;
+    config.max_batch_size = 4;
+    config.max_num_seqs = 4;
 
     let executor = TinyLlmExecutor::new(&path, config.clone()).expect("tinyllm_load failed");
     let mut engine = InferenceEngine::with_components(
@@ -155,9 +257,70 @@ fn tiny_llm_backend_decode_overrun_reports_clear_error() {
 
     // 资源守恒：失败后 KV 也应归还
     let util = engine.memory_utilization();
-    assert!(util < 0.05, "失败后 tiny-llm KV 未归还: {util}");
+    assert_eq!(util, 0.0, "失败后 tiny-llm 逻辑 KV 未归还");
 
     let m = engine.get_metrics();
     assert_eq!(m.completed_requests, 0);
     assert_eq!(m.failed_requests, 1);
+
+    for c in run_reuse_probe(&mut engine) {
+        assert!(c.success, "越界之后无法复用后端: {:?}", c.error);
+        assert_eq!(c.cancellation, None);
+    }
+    let metrics = engine.get_metrics();
+    assert_eq!(metrics.completed_requests, 4);
+    assert_eq!(metrics.failed_requests, 1);
+    assert_eq!(metrics.cancelled_requests, 0);
+    eprintln!("越界终态后，同一后端的四请求复用成功");
+}
+
+#[test]
+fn tiny_llm_backend_cancelled_batches_reuse_same_backend() {
+    let config = lifecycle_config();
+    let executor = TinyLlmExecutor::new(&model_path(), config.clone()).unwrap();
+    let mut engine = lifecycle_engine(config, Box::new(executor));
+
+    for steps in [1, 2] {
+        cancel_full_batch(&mut engine, steps);
+        for c in run_reuse_probe(&mut engine) {
+            assert!(c.success, "取消后无法复用后端: {:?}", c.error);
+            assert_eq!(c.cancellation, None);
+        }
+        let metrics = engine.get_metrics();
+        assert_eq!(metrics.cancelled_requests, steps as u64 * 4);
+        assert_eq!(metrics.completed_requests, steps as u64 * 4);
+        assert_eq!(metrics.failed_requests, 0);
+        eprintln!("执行 {steps} 步后取消四请求，同一后端四请求复用成功: {metrics:?}");
+    }
+    assert_eq!(engine.get_metrics().total_requests, 16);
+}
+
+#[test]
+fn tiny_llm_backend_withheld_release_control_distinguishes_strategies() {
+    let config = lifecycle_config();
+    let executor = TinyLlmExecutor::new(&model_path(), config.clone()).unwrap();
+    let mut engine = lifecycle_engine(config, Box::new(WithheldRelease(executor)));
+    cancel_full_batch(&mut engine, 2);
+
+    let completed = run_reuse_probe(&mut engine);
+    let contiguous = std::env::var("PAGED_SERVING_TINY_LLM_STRATEGY").as_deref() == Ok("2");
+    for c in &completed {
+        assert_eq!(c.cancellation, None);
+        if contiguous {
+            assert!(!c.success, "连续 KV 缺释放通知时必须识别槽位耗尽");
+            let err = c.error.as_ref().expect("耗尽必须报告错误");
+            assert!(
+                err.contains("tinyllm_allocate_sequence"),
+                "非预期错误: {err}"
+            );
+        } else {
+            assert!(c.success, "分页 KV 没有此连续槽位限制: {:?}", c.error);
+        }
+    }
+    let metrics = engine.get_metrics();
+    assert_eq!(metrics.cancelled_requests, 4);
+    assert_eq!(metrics.failed_requests, if contiguous { 4 } else { 0 });
+    assert_eq!(metrics.completed_requests, if contiguous { 0 } else { 4 });
+    eprintln!("拦截释放通知对照: contiguous={contiguous}, {metrics:?}");
+    eprintln!("探针终态: {completed:?}");
 }

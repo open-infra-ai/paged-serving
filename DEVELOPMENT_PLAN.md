@@ -675,7 +675,7 @@ cargo bench --bench concurrency_benchmark -- --test   # smoke
 4. ROADMAP 更新：
    - 已完成的勾选；
    - 明确“不继续实现”的边界：无抢占、无 chunked prefill、无 prefix caching、无生产 CUDA kernel；
-   - 指向 tiny-llm / cuflash-attn 后续工作。
+   - 指向 tiny-llm / cuflash 后续工作。
 5. README 增加“开发结束标准”一节，声明本仓库进入低优先级维护状态。
 6. 打 tag：`git tag v0.2.0`。
 

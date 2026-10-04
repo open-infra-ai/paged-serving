@@ -1,8 +1,8 @@
 //! Serving 压测客户端（loadgen）：对 OpenAI 兼容 `/v1/completions`（SSE 流式）
 //! 端点做可复现负载实验。
 //!
-//! 同一二进制零改动覆盖三个后端：paged-serving / llama-server / vLLM，
-//! 保证横向可比（口径定义见 `benchmarks/serving/methodology.md`）。
+//! 面向 paged-serving / llama-server / vLLM 使用统一采集口径；各后端仍须
+//! 协议 canary 与等价工作量验证（见 `benchmarks/serving/methodology.md`）。
 //!
 //! # 负载模型
 //! - `--mode closed`：闭环饱和——固定 `--concurrency` 个并发槽，一个请求完成
@@ -121,11 +121,48 @@ struct DatasetEntry {
     prompt_tokens: Option<u32>,
 }
 
+// flatten 保留 JSON 对象表示并忽略 provider 扩展；不接受 struct 的数组表示。
+#[derive(Deserialize)]
+struct CompletionFrame {
+    choices: Option<Vec<CompletionChoice>>,
+    usage: Option<CompletionUsage>,
+    error: Option<CompletionStreamError>,
+    #[serde(flatten)]
+    _extensions: serde::de::IgnoredAny,
+}
+
+#[derive(Deserialize)]
+struct CompletionChoice {
+    text: String,
+    finish_reason: Option<String>,
+    index: Option<u32>,
+    #[serde(flatten)]
+    _extensions: serde::de::IgnoredAny,
+}
+
+#[derive(Deserialize)]
+struct CompletionUsage {
+    completion_tokens: u32,
+    #[serde(flatten)]
+    _extensions: serde::de::IgnoredAny,
+}
+
+#[derive(Deserialize)]
+struct CompletionStreamError {
+    message: String,
+    #[serde(flatten)]
+    _extensions: serde::de::IgnoredAny,
+}
+
 #[derive(Serialize, Clone)]
 struct RequestRecord {
     request_id: usize,
     /// 测量窗口内序号（warmup 请求为 null）
     measured_index: Option<usize>,
+    /// Poisson 计划到达时间，相对测量起点；closed/warmup 为 null。
+    scheduled_arrival_ms: Option<f64>,
+    /// 实际开始执行请求的时间，相对测量起点；不是服务端/网络到达时间。
+    dispatch_offset_ms: Option<f64>,
     ok: bool,
     error_class: Option<String>,
     /// 错误详情（stream_error 的服务端消息等；聚合统计仍用 error_class）
@@ -186,6 +223,8 @@ struct RunConfigSummary {
     rate: Option<f64>,
     /// 实际用于 Poisson 指数间隔的随机种子；closed 模式为 null。
     arrival_seed: Option<u64>,
+    /// 新测量窗口从 seed 重置 RNG，并使用累积绝对 deadline；closed 为 null。
+    arrival_schedule: Option<&'static str>,
     max_tokens: u32,
     warmup_secs: u64,
     timeout_secs: u64,
@@ -219,6 +258,8 @@ fn failure_record(
     RequestRecord {
         request_id,
         measured_index,
+        scheduled_arrival_ms: None,
+        dispatch_offset_ms: None,
         ok: false,
         error_class: Some(error_class.to_string()),
         error_detail,
@@ -337,15 +378,18 @@ async fn run_request(
     let mut finish_reason: Option<String> = None;
     let mut stream_failure: Option<(String, String)> = None;
     let mut saw_done = false;
+    let mut saw_completion = false;
 
     'outer: while let Some(item) = stream.next().await {
         let bytes = match item {
             Ok(b) => b,
             Err(e) => {
-                stream_failure = Some((
-                    "stream_error".to_string(),
-                    format!("stream read error: {e}"),
-                ));
+                let class = if e.is_timeout() {
+                    "timeout"
+                } else {
+                    "stream_error"
+                };
+                stream_failure = Some((class.to_string(), format!("stream read error: {e}")));
                 break;
             }
         };
@@ -371,49 +415,59 @@ async fn run_request(
                 saw_done = true;
                 break 'outer;
             }
-            let v = match serde_json::from_str::<serde_json::Value>(&payload) {
+            let frame = match serde_json::from_str::<CompletionFrame>(&payload) {
                 Ok(value) => value,
                 Err(e) => {
                     stream_failure = Some((
                         "protocol_error".to_string(),
-                        format!("invalid JSON in SSE data: {e}"),
+                        format!("invalid completions SSE data: {e}"),
                     ));
                     break 'outer;
                 }
             };
-            if let Some(err) = v.get("error") {
+            if let Some(err) = frame.error {
+                stream_failure = Some(if err.message.is_empty() {
+                    (
+                        "protocol_error".to_string(),
+                        "empty message in SSE error".to_string(),
+                    )
+                } else {
+                    ("stream_error".to_string(), err.message)
+                });
+                break 'outer;
+            }
+            if frame.choices.is_none() && frame.usage.is_none() {
                 stream_failure = Some((
-                    "stream_error".to_string(),
-                    err.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown stream error")
-                        .to_string(),
+                    "protocol_error".to_string(),
+                    "SSE data contains neither choices nor usage".to_string(),
                 ));
                 break 'outer;
             }
-            // 最终帧：usage / finish_reason（text 通常为空）
-            if let Some(usage) = v.get("usage") {
-                if let Some(ct) = usage
-                    .get("completion_tokens")
-                    .and_then(|c| c.as_u64())
-                    .and_then(|ct| u32::try_from(ct).ok())
-                {
-                    completion_tokens = Some(ct);
-                }
+            let choices = frame.choices.unwrap_or_default();
+            if choices.len() > 1
+                || choices
+                    .first()
+                    .is_some_and(|c| c.index.is_some_and(|i| i != 0))
+            {
+                stream_failure = Some((
+                    "protocol_error".to_string(),
+                    "expected a single completion candidate with index 0".to_string(),
+                ));
+                break 'outer;
             }
-            if let Some(choice) = v.get("choices").and_then(|c| c.get(0)) {
-                if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+            saw_completion |= !choices.is_empty() || frame.usage.is_some();
+            if let Some(usage) = frame.usage {
+                completion_tokens = Some(usage.completion_tokens);
+            }
+            if let Some(choice) = choices.into_iter().next() {
+                if let Some(fr) = choice.finish_reason {
                     if !fr.is_empty() {
-                        finish_reason = Some(fr.to_string());
+                        finish_reason = Some(fr);
                     }
                 }
-                let text = choice
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or_default();
-                if !text.is_empty() {
+                if !choice.text.is_empty() {
                     chunk_times.push(Instant::now());
-                    output_text.push_str(text);
+                    output_text.push_str(&choice.text);
                 }
             }
         }
@@ -422,7 +476,7 @@ async fn run_request(
     let duration_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
     // 失败归类：流内 error > 无 [DONE]（即使已收到部分 chunk 也判失败，
-    // 成功率口径不掺水）> 正常
+    // 成功率口径不掺水）> 空 completion > 正常
     let (ok, error_class, error_detail) = if let Some((class, message)) = &stream_failure {
         (false, Some(class.clone()), Some(message.clone()))
     } else if !saw_done {
@@ -430,6 +484,12 @@ async fn run_request(
             false,
             Some("no_done".to_string()),
             Some("SSE stream ended without [DONE]".to_string()),
+        )
+    } else if !saw_completion {
+        (
+            false,
+            Some("protocol_error".to_string()),
+            Some("SSE stream has [DONE] but no completion choice or usage".to_string()),
         )
     } else {
         (true, None, None)
@@ -455,6 +515,8 @@ async fn run_request(
     RequestRecord {
         request_id,
         measured_index,
+        scheduled_arrival_ms: None,
+        dispatch_offset_ms: None,
         ok,
         error_class,
         error_detail,
@@ -586,6 +648,7 @@ fn build_summary(records: &[RequestRecord], wall_secs: f64, args: &Args) -> RunS
             concurrency: (args.mode == "closed").then_some(args.concurrency),
             rate: (args.mode == "poisson").then_some(args.rate),
             arrival_seed: (args.mode == "poisson").then_some(args.seed).flatten(),
+            arrival_schedule: (args.mode == "poisson").then_some("absolute_deadline_seed_reset"),
             max_tokens: args.max_tokens,
             warmup_secs: args.warmup_secs,
             timeout_secs: args.timeout_secs,
@@ -770,10 +833,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let next_id = Arc::new(AtomicUsize::new(0));
 
     // 取下一个数据集条目（环绕）；返回 (全局请求 id, 条目)。
-    let pick = |next_id: &Arc<AtomicUsize>, dataset: &Arc<Vec<DatasetEntry>>| {
-        let id = next_id.fetch_add(1, Ordering::Relaxed);
-        (id, dataset[id % dataset.len()].clone())
-    };
+    let pick =
+        |next_id: &Arc<AtomicUsize>, dataset: &Arc<Vec<DatasetEntry>>, index: Option<usize>| {
+            let id = next_id.fetch_add(1, Ordering::Relaxed);
+            (id, dataset[index.unwrap_or(id) % dataset.len()].clone())
+        };
 
     let measured_count = Arc::new(AtomicUsize::new(0));
 
@@ -793,7 +857,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 warmup_handles.push(tokio::spawn(async move {
                     while !stop.load(Ordering::Relaxed) {
-                        let (id, entry) = pick(&next_id, &dataset);
+                        let (id, entry) = pick(&next_id, &dataset, None);
                         let rec = run_request(
                             &client,
                             &args,
@@ -812,7 +876,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_secs(args.warmup_secs)).await;
             stop.store(true, Ordering::Relaxed);
             for h in warmup_handles {
-                let _ = h.await;
+                h.await?;
             }
             println!("warmup 完成（{}s），开始测量窗口", args.warmup_secs);
         }
@@ -836,8 +900,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if idx >= args.requests {
                         break;
                     }
-                    let (id, entry) = pick(&next_id, &dataset);
-                    let rec = run_request(
+                    let (id, entry) = pick(&next_id, &dataset, Some(idx));
+                    let dispatch_offset_ms = measure_start.elapsed().as_secs_f64() * 1000.0;
+                    let mut rec = run_request(
                         &client,
                         &args,
                         id,
@@ -846,12 +911,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         output_tokenizer.as_deref(),
                     )
                     .await;
+                    rec.dispatch_offset_ms = Some(dispatch_offset_ms);
                     records.lock().unwrap().push(rec);
                 }
             }));
         }
         for h in handles {
-            let _ = h.await;
+            h.await?;
         }
         measure_start.elapsed().as_secs_f64()
     } else {
@@ -865,10 +931,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 先发射 warmup 流量（不计入 issued 上限）。
         if args.warmup_secs > 0 {
             let warmup_until = Instant::now() + Duration::from_secs(args.warmup_secs);
+            let mut arrival_at = Instant::now();
             while Instant::now() < warmup_until {
                 let dt = poisson_interval_secs(&mut rng, args.rate);
-                tokio::time::sleep(Duration::from_secs_f64(dt)).await;
-                let (id, entry) = pick(&next_id, &dataset);
+                arrival_at += Duration::from_secs_f64(dt);
+                if arrival_at >= warmup_until {
+                    tokio::time::sleep_until(warmup_until.into()).await;
+                    break;
+                }
+                tokio::time::sleep_until(arrival_at.into()).await;
+                if Instant::now() >= warmup_until {
+                    break;
+                }
+                let (id, entry) = pick(&next_id, &dataset, None);
                 let (client, args, output_tokenizer) =
                     (client.clone(), args.clone(), output_tokenizer.clone());
                 warmup_handles.push(tokio::spawn(async move {
@@ -884,17 +959,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }));
             }
             for h in warmup_handles {
-                let _ = h.await; // warmup 结果丢弃，仅起预热作用
+                h.await?; // warmup 结果丢弃，执行任务失败则退出。
             }
             println!("warmup 完成（{}s），开始测量窗口", args.warmup_secs);
         }
         let measure_start = Instant::now();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut scheduled_offset = Duration::ZERO;
 
         while issued < args.requests {
             let dt = poisson_interval_secs(&mut rng, args.rate);
-            tokio::time::sleep(Duration::from_secs_f64(dt)).await;
-            let (id, entry) = pick(&next_id, &dataset);
+            scheduled_offset += Duration::from_secs_f64(dt);
+            tokio::time::sleep_until((measure_start + scheduled_offset).into()).await;
             let idx = issued;
+            let (id, entry) = pick(&next_id, &dataset, Some(idx));
             issued += 1;
             let (client, args, records, output_tokenizer) = (
                 client.clone(),
@@ -903,7 +981,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_tokenizer.clone(),
             );
             handles.push(tokio::spawn(async move {
-                let rec = run_request(
+                let dispatch_offset_ms = measure_start.elapsed().as_secs_f64() * 1000.0;
+                let mut rec = run_request(
                     &client,
                     &args,
                     id,
@@ -912,11 +991,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     output_tokenizer.as_deref(),
                 )
                 .await;
+                rec.scheduled_arrival_ms = Some(scheduled_offset.as_secs_f64() * 1000.0);
+                rec.dispatch_offset_ms = Some(dispatch_offset_ms);
                 records.lock().unwrap().push(rec);
             }));
         }
         for h in handles {
-            let _ = h.await;
+            h.await?;
         }
         measure_start.elapsed().as_secs_f64()
     };
@@ -986,6 +1067,8 @@ mod tests {
         RequestRecord {
             request_id: 0,
             measured_index: Some(0),
+            scheduled_arrival_ms: None,
+            dispatch_offset_ms: None,
             ok: true,
             error_class: None,
             error_detail: None,
@@ -1004,6 +1087,8 @@ mod tests {
         RequestRecord {
             request_id: 0,
             measured_index: Some(0),
+            scheduled_arrival_ms: None,
+            dispatch_offset_ms: None,
             ok: false,
             error_class: Some(class.to_string()),
             error_detail: Some("detail".to_string()),
@@ -1019,8 +1104,7 @@ mod tests {
     }
 
     // ---- 真实 HTTP/SSE 回归：本地一次性 server ----
-    // 用 std::net 而非 tokio::net：本 crate 未启用 tokio "net" feature，
-    // 测试 server 只需阻塞写若干字节。
+    // 单请求夹具用 std::net 直接控制原始字节，便于制造分帧、非法 UTF-8 和断流。
 
     /// 读完一个 HTTP 请求（headers + Content-Length body）。若未消费请求体
     /// 就提前写响应并关连接，client 可能先读到 RST 而非响应。
@@ -1105,12 +1189,44 @@ mod tests {
 
     /// 对一次性 server 执行一次真实 run_request，返回聚合后的 record。
     async fn run_against(response: Vec<u8>, mut args: Args) -> RequestRecord {
+        run_against_with_tokenizer(response, &mut args, None).await
+    }
+
+    async fn run_against_with_tokenizer(
+        response: Vec<u8>,
+        args: &mut Args,
+        tokenizer: Option<&Tokenizer>,
+    ) -> RequestRecord {
         let (base_url, join) = spawn_server(move |stream| {
             use std::io::Write;
             let _ = stream.write_all(&response);
             let _ = stream.flush();
         });
         args.base_url = base_url;
+        let rec = run_request(
+            &reqwest::Client::new(),
+            args,
+            0,
+            Some(0),
+            &test_entry(),
+            tokenizer,
+        )
+        .await;
+        join.join().expect("test server thread");
+        rec
+    }
+
+    async fn run_stalled_response(response: Vec<u8>) -> RequestRecord {
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let (base_url, join) = spawn_server(move |stream| {
+            use std::io::Write;
+            stream.write_all(&response).unwrap();
+            stream.flush().unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let mut args = test_args();
+        args.base_url = base_url;
+        args.timeout_secs = 1;
         let rec = run_request(
             &reqwest::Client::new(),
             &args,
@@ -1120,7 +1236,8 @@ mod tests {
             None,
         )
         .await;
-        join.join().expect("test server thread");
+        release.send(()).unwrap();
+        join.join().expect("stalled test server thread");
         rec
     }
 
@@ -1238,25 +1355,59 @@ mod tests {
 
     #[tokio::test]
     async fn run_request_classifies_timeout() {
-        let (base_url, _join) = spawn_server(|_stream| {
-            // 读完请求后保持连接不响应；客户端 1s 超时先触发。
-            // 不 join：server 线程睡完即退，与测试无共享状态。
-            std::thread::sleep(Duration::from_secs(3));
-        });
-        let mut args = test_args();
-        args.base_url = base_url;
-        args.timeout_secs = 1;
-        let rec = run_request(
-            &reqwest::Client::new(),
-            &args,
-            0,
-            Some(0),
-            &test_entry(),
-            None,
-        )
+        let rec = run_stalled_response(Vec::new()).await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("timeout"));
+        assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn run_request_classifies_timeout_after_headers_before_first_chunk() {
+        let rec = run_stalled_response(http_response("200 OK", "text/event-stream", b"")).await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("timeout"));
+        assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+        assert_eq!(rec.chunks, 0);
+        assert!(rec.ttft_ms.is_none());
+        assert!(rec.completion_tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_request_body_timeout_preserves_partial_output_without_success_metrics() {
+        let rec = run_stalled_response(sse_response(&[
+            r#"{"choices":[{"text":"A","finish_reason":null}]}"#,
+            r#"{"choices":[{"text":"B","finish_reason":"length"}],"usage":{"completion_tokens":7}}"#,
+        ]))
         .await;
         assert!(!rec.ok);
         assert_eq!(rec.error_class.as_deref(), Some("timeout"));
+        assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+        assert_eq!(rec.chunks, 2);
+        assert!(rec.ttft_ms.is_some());
+        assert_eq!(rec.inter_chunk_latency_ms.len(), 1);
+        assert_eq!(rec.completion_tokens, Some(7));
+        assert_eq!(rec.tokens_source.as_deref(), Some("usage"));
+        assert_eq!(rec.finish_reason.as_deref(), Some("length"));
+        let summary = build_summary(&[rec], 2.0, &test_args());
+        assert_eq!(summary.requests.success, 0);
+        assert_eq!(summary.requests.failed, 1);
+        assert_eq!(summary.errors.get("timeout"), Some(&1));
+        assert_eq!(summary.ttft_ms.samples, 0);
+        assert_eq!(summary.inter_chunk_latency_ms.samples, 0);
+        assert_eq!(summary.tpot_ms.samples, 0);
+        assert_eq!(summary.completion_tokens.total, 0);
+        assert!(summary.throughput.output_tokens_per_second.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_request_truncated_body_is_stream_error_not_timeout() {
+        let rec = run_against(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"text\":\"x\",\"finish_reason\":null}]}\n\n".to_vec(),
+            test_args(),
+        )
+        .await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("stream_error"));
         assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
     }
 
@@ -1266,6 +1417,201 @@ mod tests {
         assert!(!rec.ok);
         assert_eq!(rec.error_class.as_deref(), Some("protocol_error"));
         assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn run_request_rejects_malformed_completion_frames() {
+        for payload in [
+            r#"{}"#,
+            r#"[]"#,
+            r#"null"#,
+            r#"42"#,
+            r#""completion""#,
+            r#"[[{"text":"A"}],null,null]"#,
+            r#"{"choices":"A"}"#,
+            r#"{"choices":[null]}"#,
+            r#"{"choices":[{}]}"#,
+            r#"{"choices":[{"text":42}]}"#,
+            r#"{"choices":[{"text":null}]}"#,
+            r#"{"choices":[{"text":"A","finish_reason":42}]}"#,
+            r#"{"choices":[{"text":"A","index":1}]}"#,
+            r#"{"choices":[{"text":"A","index":-1}]}"#,
+            r#"{"choices":[{"text":"A"},{"text":"B"}]}"#,
+            r#"{"choices":[["A",null,0]]}"#,
+        ] {
+            let rec = run_against(sse_response(&[payload, "[DONE]"]), test_args()).await;
+            assert!(!rec.ok, "malformed frame accepted: {payload}");
+            assert_eq!(
+                rec.error_class.as_deref(),
+                Some("protocol_error"),
+                "{payload}"
+            );
+            assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+            assert_eq!(rec.chunks, 0, "invalid frame must not contribute text");
+            assert!(rec.completion_tokens.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_rejects_invalid_usage_after_partial_output() {
+        for usage in [
+            r#"{"completion_tokens":-1}"#,
+            r#"{"completion_tokens":1.5}"#,
+            r#"{"completion_tokens":"3"}"#,
+            r#"{"completion_tokens":4294967296}"#,
+            r#"{"completion_tokens":null}"#,
+            r#"{}"#,
+            r#"[3]"#,
+            r#""usage""#,
+        ] {
+            let invalid = format!(r#"{{"choices":[{{"text":"B"}}],"usage":{usage}}}"#);
+            let rec = run_against(
+                sse_response(&[r#"{"choices":[{"text":"A"}]}"#, &invalid, "[DONE]"]),
+                test_args(),
+            )
+            .await;
+            assert!(!rec.ok, "invalid usage accepted: {usage}");
+            assert_eq!(rec.error_class.as_deref(), Some("protocol_error"));
+            assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+            assert_eq!(rec.chunks, 1, "retain only the preceding valid frame");
+            assert!(rec.ttft_ms.is_some());
+            assert!(rec.completion_tokens.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_invalid_usage_is_not_hidden_by_tokenizer_fallback() {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(
+                [("[UNK]".to_string(), 0), ("A".to_string(), 1)]
+                    .into_iter()
+                    .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let tokenizer = Tokenizer::new(model);
+        let rec = run_against_with_tokenizer(
+            sse_response(&[
+                r#"{"choices":[{"text":"A"}]}"#,
+                r#"{"usage":{"completion_tokens":-1}}"#,
+                "[DONE]",
+            ]),
+            &mut test_args(),
+            Some(&tokenizer),
+        )
+        .await;
+        assert!(!rec.ok);
+        assert_eq!(rec.error_class.as_deref(), Some("protocol_error"));
+        assert_eq!(rec.chunks, 1);
+        assert_eq!(rec.completion_tokens, Some(1));
+        assert_eq!(rec.tokens_source.as_deref(), Some("tokenizer_text"));
+        let summary = build_summary(&[rec], 1.0, &test_args());
+        assert_eq!(summary.requests.success, 0);
+        assert_eq!(summary.errors.get("protocol_error"), Some(&1));
+        assert_eq!(summary.ttft_ms.samples, 0);
+        assert_eq!(summary.completion_tokens.total, 0);
+        assert_eq!(summary.completion_tokens.known_requests, 0);
+        assert!(summary.throughput.output_tokens_per_second.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_request_rejects_duplicate_completion_fields() {
+        for payload in [
+            r#"{"choices":[],"choices":[{"text":"A"}]}"#,
+            r#"{"choices":null,"choices":[{"text":"A"}]}"#,
+            r#"{"usage":null,"usage":{"completion_tokens":3}}"#,
+            r#"{"choices":[{"text":"A","text":"B"}]}"#,
+            r#"{"choices":[{"text":"A","finish_reason":null,"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"text":"A","index":0,"index":0}]}"#,
+            r#"{"usage":{"completion_tokens":3,"completion_tokens":3}}"#,
+            r#"{"usage":{"completion_tokens":3,"completion_\u0074okens":4}}"#,
+            r#"{"error":null,"error":{"message":"backend failure"}}"#,
+            r#"{"error":{"message":"first","message":"second"}}"#,
+        ] {
+            let rec = run_against(sse_response(&[payload, "[DONE]"]), test_args()).await;
+            assert!(!rec.ok, "duplicate field accepted: {payload}");
+            assert_eq!(
+                rec.error_class.as_deref(),
+                Some("protocol_error"),
+                "{payload}"
+            );
+            assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+            assert_eq!(rec.chunks, 0);
+            assert!(rec.completion_tokens.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_requires_completion_before_done() {
+        for events in [vec!["[DONE]"], vec![r#"{"choices":[]}"#, "[DONE]"]] {
+            let rec = run_against(sse_response(&events), test_args()).await;
+            assert!(!rec.ok, "DONE alone is not a completion");
+            assert_eq!(rec.error_class.as_deref(), Some("protocol_error"));
+            assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+            assert_eq!(rec.chunks, 0);
+            assert!(rec.ttft_ms.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_accepts_usage_only_and_zero_tokens() {
+        for payload in [
+            r#"{"choices":[],"usage":{"completion_tokens":0}}"#,
+            r#"{"usage":{"completion_tokens":0}}"#,
+            r#"{"choices":[{"text":"","index":0,"finish_reason":"stop"}],"usage":{"completion_tokens":0}}"#,
+        ] {
+            let rec = run_against(sse_response(&[payload, "[DONE]"]), test_args()).await;
+            assert!(rec.ok, "valid zero output rejected: {payload}");
+            assert_eq!(rec.completion_tokens, Some(0));
+            assert_eq!(rec.tokens_source.as_deref(), Some("usage"));
+            assert_eq!(rec.chunks, 0);
+            assert!(rec.ttft_ms.is_none());
+            let summary = build_summary(&[rec], 1.0, &test_args());
+            assert_eq!(summary.requests.success, 1);
+            assert_eq!(summary.completion_tokens.coverage_pct, 100.0);
+            assert_eq!(summary.throughput.output_tokens_per_second, Some(0.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_accepts_extensions_and_empty_completion() {
+        for text in ["A", ""] {
+            let payload = serde_json::json!({
+                "id":"provider-id", "object":"text_completion", "metadata":{"custom":true},
+                "choices":[{"text":text, "index":0, "finish_reason":"stop", "logprobs":null}],
+                "usage":null,
+            })
+            .to_string();
+            let rec = run_against(
+                sse_response(&[r#"{"choices":[]}"#, &payload, "[DONE]"]),
+                test_args(),
+            )
+            .await;
+            assert!(rec.ok, "valid extension/empty text rejected: {text}");
+            assert_eq!(rec.chunks, u32::from(!text.is_empty()));
+            assert_eq!(rec.finish_reason.as_deref(), Some("stop"));
+            assert!(rec.completion_tokens.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_request_rejects_malformed_error_frames() {
+        for payload in [
+            r#"{"error":{}}"#,
+            r#"{"error":{"message":42}}"#,
+            r#"{"error":{"message":""}}"#,
+            r#"{"error":["backend failure"]}"#,
+        ] {
+            let rec = run_against(sse_response(&[payload, "[DONE]"]), test_args()).await;
+            assert!(!rec.ok);
+            assert_eq!(
+                rec.error_class.as_deref(),
+                Some("protocol_error"),
+                "{payload}"
+            );
+            assert!(rec.error_detail.as_deref().is_some_and(|d| !d.is_empty()));
+        }
     }
 
     #[tokio::test]
@@ -1285,19 +1631,21 @@ mod tests {
 
     #[tokio::test]
     async fn run_request_classifies_error_frame_as_stream_error() {
-        let rec = run_against(
-            sse_response(&[
-                "{\"choices\":[{\"text\":\"x\",\"finish_reason\":null}]}",
-                "{\"error\":{\"message\":\"engine overloaded\"}}",
-                "[DONE]",
-            ]),
-            test_args(),
-        )
-        .await;
-        assert!(!rec.ok);
-        assert_eq!(rec.error_class.as_deref(), Some("stream_error"));
-        // 服务端错误消息透传为 detail（样例 record 保留非空 detail）。
-        assert_eq!(rec.error_detail.as_deref(), Some("engine overloaded"));
+        for message in ["engine overloaded", "backend timeout"] {
+            let error = serde_json::json!({"error": {"message": message}}).to_string();
+            let rec = run_against(
+                sse_response(&[
+                    "{\"choices\":[{\"text\":\"x\",\"finish_reason\":null}]}",
+                    &error,
+                    "[DONE]",
+                ]),
+                test_args(),
+            )
+            .await;
+            assert!(!rec.ok);
+            assert_eq!(rec.error_class.as_deref(), Some("stream_error"));
+            assert_eq!(rec.error_detail.as_deref(), Some(message));
+        }
     }
 
     #[tokio::test]

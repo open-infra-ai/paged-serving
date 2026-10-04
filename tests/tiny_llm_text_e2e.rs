@@ -3,10 +3,12 @@
 //! 门控：
 //! - 编译期：`cargo test --features tiny-llm`
 //! - 运行期：`TINY_LLM_MODEL`（GGUF）、`PSERV_TOKENIZER_JSON`（tokenizer.json）
+//! - 缺输入直接失败；使用 `--test-threads=1` 避免同时加载多个模型实例
 //!
 //! 与 `tiny_llm_backend.rs`（验证接入流程）不同，本测试验证**文本质量**：
 //! 使用 HuggingFaceTokenizer（词表与模型一致），提交真实 prompt，断言输出
-//! 可解码且非空、EOS（151645）能正确终止生成，并与 llama.cpp 生成对齐。
+//! 可解码且非空、EOS（151645）能正确终止生成，并检查历史 llama.cpp token oracle。
+//! Hello 使用全序列断言，数学请求仅检查公共前缀；本测试不启动 llama.cpp。
 
 #![cfg(feature = "tiny-llm")]
 
@@ -16,12 +18,12 @@ use paged_serving::{
 };
 use std::path::Path;
 
-fn model_path() -> Option<String> {
-    std::env::var("TINY_LLM_MODEL").ok()
+fn model_path() -> String {
+    std::env::var("TINY_LLM_MODEL").expect("真实文本测试必须设置 TINY_LLM_MODEL")
 }
 
-fn tokenizer_path() -> Option<String> {
-    std::env::var("PSERV_TOKENIZER_JSON").ok()
+fn tokenizer_path() -> String {
+    std::env::var("PSERV_TOKENIZER_JSON").expect("真实文本测试必须设置 PSERV_TOKENIZER_JSON")
 }
 
 fn build_engine(model: &str, tok_path: &str) -> InferenceEngine {
@@ -48,14 +50,8 @@ fn build_engine(model: &str, tok_path: &str) -> InferenceEngine {
 
 #[test]
 fn qwen2_text_generation_end_to_end() {
-    let Some(model) = model_path() else {
-        eprintln!("skip: set TINY_LLM_MODEL to a GGUF file to enable");
-        return;
-    };
-    let Some(tok_path) = tokenizer_path() else {
-        eprintln!("skip: set PSERV_TOKENIZER_JSON to tokenizer.json to enable");
-        return;
-    };
+    let model = model_path();
+    let tok_path = tokenizer_path();
 
     let mut engine = build_engine(&model, &tok_path);
 
@@ -95,14 +91,8 @@ fn qwen2_text_generation_end_to_end() {
 /// 验证 tiny-llm 后端生成的 token 序列与 llama.cpp 完全一致（词表 + 推理数值对齐）。
 #[test]
 fn qwen2_chat_prompt_matches_llama_cpp() {
-    let Some(model) = model_path() else {
-        eprintln!("skip: set TINY_LLM_MODEL to a GGUF file to enable");
-        return;
-    };
-    let Some(tok_path) = tokenizer_path() else {
-        eprintln!("skip: set PSERV_TOKENIZER_JSON to tokenizer.json to enable");
-        return;
-    };
+    let model = model_path();
+    let tok_path = tokenizer_path();
 
     let mut engine = build_engine(&model, &tok_path);
 
@@ -160,20 +150,13 @@ fn qwen2_chat_prompt_matches_llama_cpp() {
 /// 请求 2 分歧记录（llama-cli `-st` greedy，同模型同 prompt）：
 ///   llama.cpp 参考： [17, 10, 17, 16819, 220, 19, 13, 151645] ("2+2 equals 4.")
 ///   tiny-llm 当前：  [17, 10, 17, 374, 220, 19, 13, 151645] ("2+2 is 4.")
-///   第 4 个 token 是 W8A16（tiny-llm）vs Q4_K_M（llama.cpp）的 argmax 边界翻转
-///   （量化精度分歧），与 tiny-llm README 记录的"同 prompt 前 N token 一致、
-///   后续因量化方案分歧"结论一致，非 bug。
+///   两路径分别使用 W8A16（tiny-llm）与 Q4_K_M（llama.cpp）；量化差异是待鉴别
+///   因素，公共前缀测试本身不能证明分歧原因，也不能排除实现错误。
 /// 运行结束后资源守恒：active_sequences == 0、KV 利用率回到基线。
 #[test]
 fn qwen2_three_concurrent_paged_requests_match_llama_cpp() {
-    let Some(model) = model_path() else {
-        eprintln!("skip: set TINY_LLM_MODEL to a GGUF file to enable");
-        return;
-    };
-    let Some(tok_path) = tokenizer_path() else {
-        eprintln!("skip: set PSERV_TOKENIZER_JSON to tokenizer.json to enable");
-        return;
-    };
+    let model = model_path();
+    let tok_path = tokenizer_path();
 
     let tokenizer =
         HuggingFaceTokenizer::from_file(Path::new(&tok_path)).expect("load tokenizer.json");

@@ -56,5 +56,17 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked --verbose
       - run: cargo test --locked --verbose
+      - name: 真实 tokenizer 缺少输入必须失败
+        run: |
+          export PSERV_TOKENIZER_JSON=/unavailable/tokenizer.json
+          export PSERV_TOKENIZER_FIXTURE=/unavailable/fixture.json
+          for missing_input in PSERV_TOKENIZER_JSON PSERV_TOKENIZER_FIXTURE; do
+            gate_status=0
+            gate_output=$(env -u "$missing_input" cargo test --locked --test tokenizer_real_diff -- --ignored 2>&1) || gate_status=$?
+            printf '%s\n' "$gate_output"
+            test "$gate_status" -eq 101
+            grep -F "真实 tokenizer 测试必须设置 $missing_input" <<< "$gate_output"
+            grep -F 'test result: FAILED. 0 passed; 1 failed;' <<< "$gate_output"
+          done
       - run: cargo test --locked --doc --verbose
       - run: cargo doc --locked --no-deps

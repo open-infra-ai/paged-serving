@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overflow 策略、指标语义口径与测试方式；待评审后分 PR 实现（P0-001/002/003）。
 
 ### Fixed
+- 2026-10-04 真实测试执行批次：默认外部 tokenizer 差分明确标为 ignored，显式
+  执行缺输入即失败；启用 `tiny-llm` 的五个 GPU 集成用例缺输入直接失败。
+  CPU CI 验证缺 tokenizer/fixture 的失败出口，拒绝把编译失败或零测试当作通过；
+  README 给出串行执行与固定容量参数，区分历史 token oracle 与独立引擎对照。
 - 2026-10-04 结果语义批次：绘图写文件前拒绝模型/量化/commit 或负载参数不兼容
   的系列；不平均 token coverage 完整的部分重复。CSV/图例区分被测引擎与发压代码
   来源，附收敛状态与 `audit.json`，`--out-dir` 支持不覆盖历史产物的重验。

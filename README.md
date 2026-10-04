@@ -15,8 +15,8 @@
 > （分页 KV / continuous batching / 调度 / API）v0.2.0 已稳定；
 > 计算后端双路径：默认 CPU 参考执行器（确定性，供测试/CI），`tiny-llm` cargo feature
 > 下接入 [tiny-llm](https://github.com/open-infra-ai/tiny-llm) 真实 CUDA 后端，并已启用
-> **分页 KV（策略 1：block_tables 真实上传）**——3 并发 e2e 与 llama.cpp greedy
-> 逐 token 对齐、资源守恒成立。
+> **分页 KV（策略 1：block_tables 真实上传）**——3 并发 e2e 检查资源守恒；
+> Hello 请求与历史 llama.cpp greedy token oracle 全序列对齐，数学请求仅检查公共前缀。
 
 **[文档](#文档) | [更新日志](CHANGELOG.md)**
 
@@ -412,8 +412,8 @@ token id；`logprobs` 仍走主机完整 logits / top-k 路径。因此 continuo
 ## 测试
 
 ```bash
-# 运行所有测试
-cargo test
+# 运行默认 CPU 回归；外部 tokenizer 验证显示 ignored，GPU 目标未启用
+cargo test --locked
 
 # 运行覆盖率测试
 cargo llvm-cov --html
@@ -428,6 +428,38 @@ cargo test -- --test-threads=1
 | 属性测试 | 状态不变量 | 资源守恒、队列唯一性和容量上限 |
 | 集成测试 | 端到端工作流 | engine 与请求生命周期 |
 | Server 集成 | HTTP/SSE | API、取消、健康检查与指标 |
+
+真实输入的验证需要显式执行。以下命令从本仓根目录运行，路径按实际 checkout 调整：
+
+```bash
+export PSERV_TOKENIZER_JSON=../models/tokenizer.json
+export PSERV_TOKENIZER_FIXTURE=../tiny-llm/tests/data/tokenizer_fixture.json
+
+# 不需要 GPU；真实 tokenizer 与 HF fixture 逐 id 比较
+cargo test --locked --test tokenizer_real_diff -- --ignored
+
+# 使用干净、已记录 commit 的 tiny-llm 源码构建当前静态库，不复用来源未知的旧库
+cmake --build ../tiny-llm/build --target tiny_llm --parallel 2
+export TINY_LLM_DIR=../tiny-llm/build
+export TINY_LLM_MODEL=../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+export PAGED_SERVING_TINY_LLM_STRATEGY=1
+export PAGED_SERVING_TINY_LLM_MAX_SEQS=4
+export PAGED_SERVING_TINY_LLM_DECODE_RESERVE=512
+
+# 串行运行 2 个 GPU 接入/回收、3 个 GPU 文本与 1 个 tokenizer 测试
+cargo test --locked --features tiny-llm \
+  --test tiny_llm_backend --test tiny_llm_text_e2e --test tokenizer_real_diff \
+  -- --include-ignored --test-threads=1
+```
+
+GPU 命令要求已有 CMake 构建目录、CUDA 工具链、兼容 GPU、模型与匹配 tokenizer；
+缺库会链接失败，缺运行时输入、加载失败或 GPU 错误会使测试失败，不记为通过。
+若调整 decode reserve，越界回归的触发条件也会改变；此命令固定为 512。
+文本用例检查固定的 Qwen2.5-0.5B 历史 oracle，不是本次启动 llama.cpp 的独立对照，
+也不适用于任意模型。固定 token 不匹配时应报告失败、鉴别原因，不自动改期望。
+提交测试证据时记录双仓源码状态、输入和静态库 SHA-256；默认 CPU 绿色不代表 GPU
+验证，单次 GPU 功能验证也不代表持续门禁、HTTP 取消回收或性能结论。执行语义见
+[真实测试门禁笔记](.agents/notes/implemented/testing/2026-10-04-real-test-execution-gates.md)。
 
 ## 贡献指南
 

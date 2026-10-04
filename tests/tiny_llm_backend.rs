@@ -4,13 +4,14 @@
 //! - 编译期：`cargo test --features tiny-llm`（启用 C ABI 符号与适配器）
 //! - 链接期：`TINY_LLM_DIR` 指向 tiny-llm 构建目录（build.rs）
 //! - 运行期：`TINY_LLM_MODEL` 指向真实 GGUF 模型
+//! - 启用 feature 后缺少模型直接失败，不将未执行记为通过
 //!
 //! 使用 paged-serving 自带的 SimpleTokenizer（词表语义与 Qwen 不同），
 //! 本测试验证的是**接入流程正确性**（引擎驱动、KV 生命周期、资源守恒、
 //! 能力声明），而非文本质量；文本质量验证需接入与模型词表一致的 tokenizer。
 //!
-//! 注意：单个测试进程只 load 一次模型（0.5B 模型 + 多序列 KV 在 6GB 卡上
-//! 无法容纳多次并发实例），因此能力检查与端到端流程合并在同一测试内。
+//! 使用 `--test-threads=1` 串行执行本目标，避免两个测试同时加载模型。
+//! 每个测试复用自己的后端实例；能力检查与两波请求合并验证实例复用。
 
 #![cfg(feature = "tiny-llm")]
 
@@ -19,16 +20,13 @@ use paged_serving::{
     EngineError, GenerationParams, InferenceEngine, Scheduler, SimpleTokenizer, TinyLlmExecutor,
 };
 
-fn model_path() -> Option<String> {
-    std::env::var("TINY_LLM_MODEL").ok()
+fn model_path() -> String {
+    std::env::var("TINY_LLM_MODEL").expect("真实后端测试必须设置 TINY_LLM_MODEL")
 }
 
 #[test]
 fn tiny_llm_backend_end_to_end() {
-    let Some(path) = model_path() else {
-        eprintln!("skip: set TINY_LLM_MODEL to a GGUF file to enable");
-        return;
-    };
+    let path = model_path();
 
     let mut config = create_test_config();
     config.max_num_blocks = 256;
@@ -115,10 +113,7 @@ fn tiny_llm_backend_end_to_end() {
 /// TotalLengthTooLong 校验上限，但解码步数超过首次分配的 KV 容量。
 #[test]
 fn tiny_llm_backend_decode_overrun_reports_clear_error() {
-    let Some(path) = model_path() else {
-        eprintln!("skip: set TINY_LLM_MODEL to a GGUF file to enable");
-        return;
-    };
+    let path = model_path();
 
     let mut config = create_test_config();
     // max_model_len 需容纳 prompt + 超过 decode 预留默认值(512) 的 max_tokens，

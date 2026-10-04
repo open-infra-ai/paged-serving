@@ -17,6 +17,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  serving-evidence:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest discover -s benchmarks/serving -p 'test_*.py' -v
+      - run: python3 benchmarks/serving/validate_results.py --formal benchmarks/serving/results/2026-09-07-RTX3060Laptop-paged-serving-p2-batch-postprocess-streaming
+
   msrv:
     runs-on: ubuntu-latest
     steps:

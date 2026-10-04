@@ -31,6 +31,9 @@ SSE chunk 间隔写成 ITL。
 
 ## 对照公平性与限制
 
+- 语义审计：[命令、退出码、`audit.json` 路径；通过仅说明内部一致]
+- 收敛：[各组合 `(max−min)/mean`、`non_converged` / `insufficient_repeats`；保留全部重复]
+- 历史字段缺失：[seed/计划时间/dispatch 未采集及其影响，不补造]
 - 各后端的模型、量化、上下文上限、并发上限和启动参数。
 - W8A16、Q4_K_M、FP16 等非同量化只能叫完整路径对照，不能叫同量化性能比较。
 - 未实现的 KV 利用率采样、prefix cache、抢占或 chunked prefill 不得用推测补全。
@@ -47,5 +50,6 @@ SSE chunk 间隔写成 ITL。
 - [ ] `metadata.json`
 - [ ] 每个 run 的 `run_metadata.json`、`per_request.jsonl`、`summary.json`、`stdout.log`
 - [ ] `summary_table.csv` 与图表
+- [ ] `audit.json` 中的校验诊断与收敛限制（新生成图表产物，历史包不回填）
 - [ ] 模型 SHA-256、双仓 commit、硬件/软件版本
 - [ ] 本报告中的结论、限制和负结果

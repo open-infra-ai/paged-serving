@@ -33,3 +33,6 @@ Rust 1.88 locked all-target check 和完整测试通过：264 个默认测试与
 ## Related notes
 
 [真实 HTTP/SSE 分类](2026-09-15-real-http-sse-regression.md) 部分重叠，其单请求分类和指标口径保留，本篇定义 CLI 与测量窗口；有界事件/类型化指标笔记处理服务端，非同一决定。
+
+[结果语义与收敛](2026-10-04-serving-result-semantics.md) 验证存量/新增结果的二次引用，
+不改变本篇生产字段与负载执行口径；其历史缺字段诊断不回填原始文件。

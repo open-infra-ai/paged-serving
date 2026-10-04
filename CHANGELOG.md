@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- 2026-10-04 结果语义批次：Serving JSONL/summary/metadata 联合重算、标准库
+  正/负夹具门禁与独立 CI；`--json` 输出机器可读诊断，10% 波动标记 `non_converged`
+  而不隐藏负结果。正式校验要求至少三次重复与 30 秒预热；历史可选字段不回填。
 - 2026-10-04 CLI 批次：真实 loadgen 二进制与本地 TCP/SSE 的完整结果落盘回归，
   覆盖 closed/Poisson、warmup 排除、错误详情、token coverage 和自定义 summary 路径。
   原始请求增加 nullable `scheduled_arrival_ms` / `dispatch_offset_ms`，summary.config
@@ -23,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overflow 策略、指标语义口径与测试方式；待评审后分 PR 实现（P0-001/002/003）。
 
 ### Fixed
+- 2026-10-04 结果语义批次：绘图写文件前拒绝模型/量化/commit 或负载参数不兼容
+  的系列；不平均 token coverage 完整的部分重复。CSV/图例区分被测引擎与发压代码
+  来源，附收敛状态与 `audit.json`，`--out-dir` 支持不覆盖历史产物的重验。
 - 2026-10-04 CLI 批次：Poisson 测量 RNG 从 seed 重置，两个模式的测量 prompt
   按 measured_index 选择，避免预热吞吐改变正式输入；改为绝对 deadline，预热
   到达不越过窗口。worker JoinError 向 CLI 传播，不静默输出不完整执行的报告。

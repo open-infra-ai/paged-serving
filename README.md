@@ -461,6 +461,8 @@ done
 
 GPU 命令要求已有 CMake 构建目录、CUDA 工具链、兼容 GPU、模型与匹配 tokenizer；
 缺库会链接失败，缺运行时输入、加载失败或 GPU 错误会使测试失败，不记为通过。
+2026-10-26 复跑记录：`tests/evidence/2026-10-26-real-backend.log`（backend 4 项、
+文本 e2e 3 项、tokenizer 1 项全部通过，0 ignored；策略 1，RTX 3060 Laptop）。
 若调整 decode reserve，越界回归的触发条件也会改变；此命令固定为 512。
 文本用例检查固定的 Qwen2.5-0.5B 历史 oracle，不是本次启动 llama.cpp 的独立对照，
 也不适用于任意模型。固定 token 不匹配时应报告失败、鉴别原因，不自动改期望。

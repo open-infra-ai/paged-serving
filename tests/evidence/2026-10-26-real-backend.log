@@ -1,0 +1,107 @@
+# 2026-10-26 real-backend GPU gate
+# paged-serving commit: 6835491061a89be34c59632c414f5dbb5d2469d6
+# tiny-llm commit: cdff4e67d384049ba528d14ea139f8e82268c43c
+# libtiny_llm.a sha256: 53fe6f0a0b8ebb7416ecb81aa7f6b8e63d27cd47c52fd5835a7e5fc5b268f043
+# model: qwen2.5-0.5b-instruct-q4_k_m.gguf sha256 74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db
+# env: strategy=1 max_seqs=4 decode_reserve=512; cmd: cargo +1.88.0 test --locked --features tiny-llm --test tiny_llm_backend --test tiny_llm_text_e2e --test tokenizer_real_diff -- --include-ignored --test-threads=1
+# paths sanitized for publication
+
+   Compiling paged-serving v0.2.1 (.)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.09s
+     Running tests/tiny_llm_backend.rs (target/debug/deps/tiny_llm_backend-890c7daaa763965f)
+
+running 4 tests
+test tiny_llm_backend_cancelled_batches_reuse_same_backend ... [2026-10-26 15:53:06.832] [info] [113603] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:06.832] [info] [113603] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:53:06.880] [info] [113603] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:53:06.880] [info] [113603] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:53:06.880] [info] [113603] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:06.880] [info] [113603] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:06.880] [info] [113603] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:53:06.916] [info] [113603] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:53:06.916] [info] [113603] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:53:06.916] [info] [113603] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+ok
+test tiny_llm_backend_decode_overrun_reports_clear_error ... [2026-10-26 15:53:22.360] [info] [113608] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:22.360] [info] [113608] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:53:22.394] [info] [113608] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:53:22.394] [info] [113608] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:53:22.394] [info] [113608] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:22.394] [info] [113608] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:22.394] [info] [113608] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:53:22.426] [info] [113608] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:53:22.426] [info] [113608] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:53:22.426] [info] [113608] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+ok
+test tiny_llm_backend_end_to_end ... [2026-10-26 15:53:44.596] [info] [113669] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:44.596] [info] [113669] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:53:44.629] [info] [113669] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:53:44.629] [info] [113669] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:53:44.629] [info] [113669] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:44.629] [info] [113669] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:44.629] [info] [113669] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:53:44.661] [info] [113669] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:53:44.661] [info] [113669] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:53:44.661] [info] [113669] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+ok
+test tiny_llm_backend_withheld_release_control_distinguishes_strategies ... [2026-10-26 15:53:59.374] [info] [113699] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:59.374] [info] [113699] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:53:59.418] [info] [113699] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:53:59.418] [info] [113699] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:53:59.418] [info] [113699] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:59.418] [info] [113699] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:53:59.418] [info] [113699] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:53:59.452] [info] [113699] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:53:59.452] [info] [113699] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:53:59.452] [info] [113699] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 75.03s
+
+     Running tests/tiny_llm_text_e2e.rs (target/debug/deps/tiny_llm_text_e2e-6f6be8d276544022)
+
+running 3 tests
+test qwen2_chat_prompt_matches_llama_cpp ... [2026-10-26 15:54:18.039] [info] [113712] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:54:18.039] [info] [113712] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:54:18.085] [info] [113712] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:54:18.085] [info] [113712] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:54:18.085] [info] [113712] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:54:18.085] [info] [113712] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:54:18.085] [info] [113712] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:54:18.130] [info] [113712] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:54:18.130] [info] [113712] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:54:18.130] [info] [113712] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+ok
+test qwen2_text_generation_end_to_end ... [2026-10-26 15:54:32.451] [info] [113718] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:54:32.452] [info] [113718] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:54:32.491] [info] [113718] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:54:32.491] [info] [113718] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:54:32.491] [info] [113718] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:54:32.491] [info] [113718] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:54:32.491] [info] [113718] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:54:32.530] [info] [113718] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:54:32.530] [info] [113718] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:54:32.530] [info] [113718] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+ok
+test qwen2_three_concurrent_paged_requests_match_llama_cpp ... [2026-10-26 15:54:47.586] [info] [113747] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:54:47.586] [info] [113747] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:54:47.624] [info] [113747] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:54:47.624] [info] [113747] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:54:47.624] [info] [113747] Loading GGUF model from: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:54:47.624] [info] [113747] Parsing GGUF file: ../models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+[2026-10-26 15:54:47.624] [info] [113747] GGUF header: version=3, tensors=291, metadata_entries=26
+[2026-10-26 15:54:47.669] [info] [113747] GGUF parsing complete. Data offset: 5947744
+[2026-10-26 15:54:47.669] [info] [113747] Extracted model config: hidden_dim=896, num_layers=24, num_heads=14, num_kv_heads=2, vocab_size=151936
+[2026-10-26 15:54:47.669] [info] [113747] Model config: hidden_dim=896, num_layers=24, vocab_size=151936
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 52.63s
+
+     Running tests/tokenizer_real_diff.rs (target/debug/deps/tokenizer_real_diff-f517d9569b156466)
+
+running 1 test
+test qwen2_tokenizer_matches_tiny_llm_fixture ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.30s
+
+exit=0

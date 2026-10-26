@@ -44,7 +44,7 @@ Paged-Serving 是一个基于 Rust 构建的 LLM Serving 控制面，以模块�
 | **自动化验证** | unit、integration、server integration 与 property tests | ✅ |
 | **tiny-llm 真实后端** | `tiny-llm` feature 下接入 CUDA 后端，分页 KV（策略 1）默认启用，`PAGED_SERVING_TINY_LLM_STRATEGY=2` 可回退连续 KV；正常 greedy 把各序列末层 hidden 写入 GPU batch buffer，再批量执行 final RMSNorm、LM head 与 argmax，并一次回传整批结果；Transformer layer 仍逐序列；`PAGED_SERVING_TINY_LLM_MAX_SEQS`（默认 4）与 `PAGED_SERVING_TINY_LLM_DECODE_RESERVE`（默认 512）可按显存/生成长度调节容量 | ✅ |
 
-在五仓学习路径中，本仓库只练习 LLM Serving 控制面；真实模型权重加载与 token 计算属于 `tiny-llm`。整体顺序见 [`LEARNING_PATH.md`](https://github.com/open-infra-ai/open-infra-ai/blob/master/LEARNING_PATH.md)（meta 仓）。
+在 GPU 学习主线（五主仓）中，本仓库只练习 LLM Serving 控制面；真实模型权重加载与 token 计算属于 `tiny-llm`。整体顺序见 [`LEARNING_PATH.md`](https://github.com/open-infra-ai/open-infra-ai/blob/master/LEARNING_PATH.md)（meta 仓）。
 
 ## 项目边界（IN / OUT）
 
